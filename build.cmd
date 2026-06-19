@@ -1,0 +1,1 @@
+C:\Windows\Microsoft.NET\Framework64\v4.0.30319\csc.exe /target:exe /out:MouseWakeSuppressorService.exe /reference:System.ServiceProcess.dll,System.dll,System.Configuration.Install.dll,System.Windows.Forms.dll,System.Drawing.dll MouseWakeSuppressorService.cs

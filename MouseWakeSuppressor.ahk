@@ -1,13 +1,15 @@
 ; MouseWakeSuppressor.ahk
-; ロック画面中にマウスデバイスを PnP レベルで完全無効化し、
-; マウス移動によるモニター点灯を防ぐ AHK v2 スクリプト
-; キーボードは無効化しない (ログイン操作に必要なため)
+; ロック画面中やモニター消灯中にマウスデバイスを PnP レベルで完全無効化し、
+; マウス移動によるモニター点灯やスリープ解除を防ぐ AHK v2 スクリプト
 ;
-; 必要権限: 管理者 (pnputil コマンド実行のため)
+; このスクリプトは、設定 GUI、トレイアイコン、手動トグルのホットキーを管理し、
+; 実際のデバイス無効化/有効化および電源イベントの監視は
+; バックグラウンドで動作する Windows システムサービス "MouseWakeSuppressor" が行います。
+;
+; 必要権限: 管理者 (サービスのインストール、起動、停止、制御のため)
 ; ホットキー: Win+Shift+M → マウスを手動トグル
-; トレイアイコン: 右クリック → 状態確認・終了
 
-#Requires AutoHotkey v2.0
+#Requires AutoHotkey v2.0-
 #SingleInstance Force
 
 ; ──────────────────────────────────────────────
@@ -22,20 +24,28 @@ if !A_IsAdmin {
 ; グローバル変数
 ; ──────────────────────────────────────────────
 global g_devices := []         ; [{id: "HID\...", name: "..."}, ...]
-global g_mouseDisabled := false
-global g_powerNotifyHandle := 0
-global g_guidBuffer := 0      ; GC防止用に参照を保持
-
-; ──────────────────────────────────────────────
-; 起動時リカバリ: 前回強制終了で無効のまま残った
-; デバイスがあれば有効化する
-; ──────────────────────────────────────────────
-RecoverDevicesOnStartup()
+global g_lastState := ""       ; トレイ更新のキャッシュ用
 
 ; ──────────────────────────────────────────────
 ; 初期化
 ; ──────────────────────────────────────────────
-g_devices := LoadOrDetectDevices()
+; サービスのインストール確認と自動開始
+if !IsServiceInstalled() {
+    result := MsgBox("Mouse Wake Suppressor サービスがインストールされていません。`nインストールしますか？ (管理者権限が必要です)", 
+                     "Mouse Wake Suppressor", 0x24)
+    if result = "Yes" {
+        ServiceInstall()
+    } else {
+        MsgBox "サービスがインストールされない場合、本スクリプトは動作しません。終了します。", 
+               "Mouse Wake Suppressor", 0x10
+        ExitApp
+    }
+} else if !IsServiceRunning() {
+    ServiceStart()
+}
+
+; 対象デバイスのロード、未設定の場合は GUI 選択
+g_devices := LoadOrDetectDevices(true)
 
 if g_devices.Length = 0 {
     MsgBox "対象マウスデバイスが選択されませんでした。終了します。",
@@ -43,90 +53,87 @@ if g_devices.Length = 0 {
     ExitApp
 }
 
-; セッション変更通知を登録 (WM_WTSSESSION_CHANGE = 0x02B1)
-OnMessage(0x02B1, HandleSessionChange)
-if !DllCall("Wtsapi32.dll\WTSRegisterSessionNotification",
-            "ptr", A_ScriptHwnd, "uint", 1) {
-    MsgBox "セッション変更通知の登録に失敗しました。",
-           "Mouse Wake Suppressor", 0x10
-    ExitApp
-}
-
-; モニター電源状態の通知を登録 (GUID_CONSOLE_DISPLAY_STATE)
-; ディスプレイOFF/ON を検知してマウスを無効化/有効化する
-g_guidBuffer := Buffer(16)
-NumPut("uint",   0x6FE69556, g_guidBuffer, 0)
-NumPut("ushort", 0x704A,     g_guidBuffer, 4)
-NumPut("ushort", 0x47A0,     g_guidBuffer, 6)
-NumPut("uchar",  0x8F, "uchar", 0x24, "uchar", 0xC2, "uchar", 0x8D,
-       "uchar",  0x93, "uchar", 0x6F, "uchar", 0xDA, "uchar", 0x47,
-       g_guidBuffer, 8)
-g_powerNotifyHandle := DllCall("RegisterPowerSettingNotification",
-    "ptr", A_ScriptHwnd, "ptr", g_guidBuffer, "uint", 0, "ptr")
-OnMessage(0x218, HandlePowerBroadcast)  ; WM_POWERBROADCAST
-
-OnExit(CleanupOnExit)
+; トレイアイコンとメニューの初期表示
 UpdateTray()
+
+; 1秒おきにサービスの状態を監視してトレイアイコンを自動同期
+SetTimer(UpdateTray, 1000)
 
 ; ──────────────────────────────────────────────
 ; ホットキー: Win+Shift+M → 手動トグル
 ; ──────────────────────────────────────────────
 #+m:: {
-    if g_mouseDisabled
-        EnableMouse()
-    else
-        DisableMouse()
+    ServiceControl(128) ; トグル
+    Sleep(150)
+    UpdateTray()
 }
 
 ; ──────────────────────────────────────────────
-; WM_WTSSESSION_CHANGE ハンドラ
+; サービス制御用ヘルパー
 ; ──────────────────────────────────────────────
-HandleSessionChange(wParam, lParam, msg, hwnd) {
-    ; ロック時にはマウスを無効化しない (モニターOFFのみで制御)
-    if (wParam = 0x8)       ; WTS_SESSION_UNLOCK
-        EnableMouse()
-    else if (wParam = 0x6)  ; WTS_SESSION_LOGOFF
-        ForceEnableMouse()
+IsServiceInstalled() {
+    return RunWait('sc query MouseWakeSuppressor',, "Hide") != 1060 ; ERROR_SERVICE_DOES_NOT_EXIST = 1060
 }
 
-; ──────────────────────────────────────────────
-; WM_POWERBROADCAST ハンドラ
-; モニター電源状態: 0=OFF, 1=ON, 2=DIMMED
-; ──────────────────────────────────────────────
-HandlePowerBroadcast(wParam, lParam, msg, hwnd) {
-    if (wParam != 0x8013)  ; PBT_POWERSETTINGCHANGE
+IsServiceRunning() {
+    tmpFile := A_Temp "\mws_sc.txt"
+    try FileDelete(tmpFile)
+    RunWait 'cmd.exe /c sc query MouseWakeSuppressor > "' tmpFile '"',, "Hide"
+    if !FileExist(tmpFile)
+        return false
+    content := FileRead(tmpFile)
+    try FileDelete(tmpFile)
+    return InStr(content, "STATE") && InStr(content, "RUNNING")
+}
+
+ServiceInstall() {
+    serviceExe := A_ScriptDir "\MouseWakeSuppressorService.exe"
+    if !FileExist(serviceExe) {
+        MsgBox "サービス実行ファイルが見つかりません: `n" serviceExe, "Mouse Wake Suppressor", 0x10
         return
-    ; POWERBROADCAST_SETTING 構造体:
-    ;   +0  GUID (16 bytes)
-    ;   +16 DataLength (4 bytes)
-    ;   +20 Data (DWORD: display state)
-    displayState := NumGet(lParam, 20, "uint")
-    if (displayState = 0)       ; ディスプレイ OFF
-        DisableMouse()
-    else if (displayState = 1)  ; ディスプレイ ON
-        EnableMouse()
-}
-
-; ──────────────────────────────────────────────
-; 起動時リカバリ: 設定ファイルから保存済みデバイスを読み、
-; 全て pnputil /enable-device で有効化する
-; ──────────────────────────────────────────────
-RecoverDevicesOnStartup() {
-    configFile := A_ScriptDir "\mws_config.ini"
-    savedIds := IniRead(configFile, "Devices", "InstanceIds", "")
-    if savedIds = ""
-        return
-    for id in StrSplit(savedIds, "|") {
-        id := Trim(id)
-        if id != ""
-            RunWait 'cmd.exe /c pnputil /enable-device "' id '"',, "Hide"
     }
+    RunWait '"' serviceExe '" -install',, "Hide"
+    RunWait 'sc start MouseWakeSuppressor',, "Hide"
+}
+
+ServiceUninstall() {
+    serviceExe := A_ScriptDir "\MouseWakeSuppressorService.exe"
+    RunWait 'sc stop MouseWakeSuppressor',, "Hide"
+    if FileExist(serviceExe) {
+        RunWait '"' serviceExe '" -uninstall',, "Hide"
+    }
+}
+
+ServiceStart() {
+    RunWait 'sc start MouseWakeSuppressor',, "Hide"
+}
+
+ServiceStop() {
+    RunWait 'sc stop MouseWakeSuppressor',, "Hide"
+}
+
+ServiceControl(code) {
+    RunWait 'sc control MouseWakeSuppressor ' code,, "Hide"
+}
+
+GetMouseStateFromService() {
+    stateFile := A_ScriptDir "\mws_state.txt"
+    if !FileExist(stateFile)
+        return "UNKNOWN"
+    try {
+        content := Trim(FileRead(stateFile))
+        if content == "1"
+            return "ENABLED"
+        if content == "0"
+            return "DISABLED"
+    }
+    return "UNKNOWN"
 }
 
 ; ──────────────────────────────────────────────
 ; 設定ファイルからロードまたは新規検出
 ; ──────────────────────────────────────────────
-LoadOrDetectDevices() {
+LoadOrDetectDevices(showGui := true) {
     configFile := A_ScriptDir "\mws_config.ini"
 
     ; 保存済みの設定があれば読み込む
@@ -146,6 +153,9 @@ LoadOrDetectDevices() {
             return devices
     }
 
+    if !showGui
+        return []
+
     ; powershell.exe (Windows PowerShell 5.1) でマウスデバイスを列挙
     allDevices := EnumMouseDevices()
 
@@ -159,6 +169,7 @@ LoadOrDetectDevices() {
     ; 1台だけなら自動選択、複数なら GUI で選択
     if allDevices.Length = 1 {
         SaveDeviceConfig(configFile, allDevices)
+        ServiceControl(131) ; サービスに設定リロードを通知
         return allDevices
     }
     return SelectDevicesGui(allDevices, configFile)
@@ -166,15 +177,12 @@ LoadOrDetectDevices() {
 
 ; ──────────────────────────────────────────────
 ; powershell.exe でマウスクラスのデバイスを列挙
-; 出力形式: InstanceId<TAB>FriendlyName (1行1デバイス)
 ; ──────────────────────────────────────────────
 EnumMouseDevices() {
     devices := []
     tmpFile := A_Temp "\mws_enum.txt"
     ps1File := A_Temp "\mws_enum.ps1"
 
-    ; PowerShell スクリプトを一時ファイルに書き出して実行 (エスケープ問題を回避)
-    ; 出力形式: InstanceId;;FriendlyName;;Manufacturer;;Status
     try FileDelete(ps1File)
     psScript := "Get-PnpDevice -Class Mouse -PresentOnly"
               . " | ForEach-Object {"
@@ -212,7 +220,7 @@ EnumMouseDevices() {
 ; GUI でデバイスを選択させる
 ; ──────────────────────────────────────────────
 SelectDevicesGui(allDevices, configFile) {
-    gw := Gui("+AlwaysOnTop", "Mouse Wake Suppressor — デバイス選択")
+    gw := Gui("+AlwaysOnTop", "Mouse Wake Suppressor - デバイス選択")
     gw.SetFont("s10")
     gw.Add("Text",, "モニターOFF時に無効化するマウスデバイスを選択してください。`n(複数選択可: Ctrl+クリック)")
 
@@ -238,7 +246,7 @@ SelectDevicesGui(allDevices, configFile) {
     gw.OnEvent("Close", (*) => (cancelled := true))
 
     gw.Show()
-    while WinExist("Mouse Wake Suppressor — デバイス選択")
+    while WinExist("Mouse Wake Suppressor - デバイス選択")
         Sleep 100
 
     if cancelled || selected.Length = 0
@@ -249,6 +257,7 @@ SelectDevicesGui(allDevices, configFile) {
         devices.Push(allDevices[idx])
 
     SaveDeviceConfig(configFile, devices)
+    ServiceControl(131) ; サービスに設定リロードを通知
     return devices
 }
 
@@ -267,65 +276,50 @@ SaveDeviceConfig(configFile, devices) {
 }
 
 ; ──────────────────────────────────────────────
-; マウスデバイスを PnP レベルで無効化
-; ──────────────────────────────────────────────
-DisableMouse() {
-    global g_mouseDisabled
-    if g_mouseDisabled
-        return
-    for d in g_devices
-        RunWait 'cmd.exe /c pnputil /disable-device "' d.id '"',, "Hide"
-    g_mouseDisabled := true
-    UpdateTray()
-}
-
-; ──────────────────────────────────────────────
-; マウスデバイスを PnP レベルで有効化
-; ──────────────────────────────────────────────
-EnableMouse() {
-    global g_mouseDisabled
-    if !g_mouseDisabled
-        return
-    for d in g_devices
-        RunWait 'cmd.exe /c pnputil /enable-device "' d.id '"',, "Hide"
-    g_mouseDisabled := false
-    UpdateTray()
-}
-
-; ──────────────────────────────────────────────
-; 強制有効化 (終了時用: フラグを無視して必ず有効化)
-; ──────────────────────────────────────────────
-ForceEnableMouse() {
-    for d in g_devices
-        RunWait 'cmd.exe /c pnputil /enable-device "' d.id '"',, "Hide"
-}
-
-; ──────────────────────────────────────────────
 ; トレイアイコンとメニューを更新
 ; ──────────────────────────────────────────────
 UpdateTray() {
-    global g_mouseDisabled, g_devices
+    global g_lastState, g_devices
 
-    if g_mouseDisabled {
+    currentState := GetMouseStateFromService()
+    serviceRunning := IsServiceRunning()
+    
+    if !serviceRunning {
+        currentState := "STOPPED"
+    }
+
+    ; 状態キャッシュチェック
+    if (currentState == g_lastState)
+        return
+    g_lastState := currentState
+
+    if currentState == "DISABLED" {
         TraySetIcon "shell32.dll", 131
-        A_IconTip := "Mouse Wake Suppressor [マウス無効]`nWin+Shift+M で有効化"
-    } else {
+        A_IconTip := "Mouse Wake Suppressor`nMouse [DISABLED] (Win+Shift+M to Enable)"
+    } else if currentState == "ENABLED" {
         TraySetIcon "shell32.dll", 18
-        A_IconTip := "Mouse Wake Suppressor [マウス有効]`nWin+Shift+M で無効化"
+        A_IconTip := "Mouse Wake Suppressor`nMouse [ENABLED] (Win+Shift+M to Disable)"
+    } else {
+        TraySetIcon "shell32.dll", 110
+        A_IconTip := "Mouse Wake Suppressor`nService is NOT running!"
     }
 
     A_TrayMenu.Delete()
 
-    if g_mouseDisabled {
-        A_TrayMenu.Add("● マウス: 無効中  → 有効化", (*) => EnableMouse())
-        A_TrayMenu.Default := "● マウス: 無効中  → 有効化"
-    } else {
-        A_TrayMenu.Add("○ マウス: 有効  → 無効化", (*) => DisableMouse())
-        A_TrayMenu.Default := "○ マウス: 有効  → 無効化"
+    if currentState == "DISABLED" {
+        A_TrayMenu.Add("Mouse: DISABLED (-> to Enable)", (*) => (ServiceControl(128), Sleep(150), UpdateTray()))
+        A_TrayMenu.Default := "Mouse: DISABLED (-> to Enable)"
+    } else if currentState == "ENABLED" {
+        A_TrayMenu.Add("Mouse: ENABLED (-> to Disable)", (*) => (ServiceControl(128), Sleep(150), UpdateTray()))
+        A_TrayMenu.Default := "Mouse: ENABLED (-> to Disable)"
+    } else if currentState == "STOPPED" {
+        A_TrayMenu.Add("サービスが停止しています (開始する)", (*) => (ServiceStart(), Sleep(500), UpdateTray()))
+        A_TrayMenu.Default := "サービスが停止しています (開始する)"
     }
     A_TrayMenu.Add()
 
     ; デバイス一覧
+    g_devices := LoadOrDetectDevices(false)
     for d in g_devices {
         label := "  " d.name
         if d.HasProp("manufacturer") && d.manufacturer != ""
@@ -336,15 +330,16 @@ UpdateTray() {
     A_TrayMenu.Add()
 
     A_TrayMenu.Add("設定リセット (mws_config.ini 削除)", ResetConfig)
-    A_TrayMenu.Add("再起動", (*) => RestartScript())
-    A_TrayMenu.Add("終了", (*) => ExitApp())
-}
-
-; ──────────────────────────────────────────────
-; スクリプト再起動
-; ──────────────────────────────────────────────
-RestartScript() {
-    Reload
+    
+    if serviceRunning {
+        A_TrayMenu.Add("サービスを停止", (*) => (ServiceStop(), Sleep(300), UpdateTray()))
+        A_TrayMenu.Add("サービスを再起動", (*) => (ServiceStop(), Sleep(500), ServiceStart(), Sleep(300), UpdateTray()))
+    } else {
+        A_TrayMenu.Add("サービスを開始", (*) => (ServiceStart(), Sleep(300), UpdateTray()))
+    }
+    A_TrayMenu.Add("サービスをアンインストール", (*) => UninstallServiceMenu())
+    A_TrayMenu.Add()
+    A_TrayMenu.Add("終了 (常駐トレイを閉じる)", (*) => ExitApp())
 }
 
 ; ──────────────────────────────────────────────
@@ -354,18 +349,24 @@ ResetConfig(*) {
     configFile := A_ScriptDir "\mws_config.ini"
     if FileExist(configFile)
         FileDelete(configFile)
-    result := MsgBox("設定をリセットしました。`n今すぐ再起動しますか？",
-                     "Mouse Wake Suppressor", 0x24)  ; Yes/No + Question icon
-    if result = "Yes"
-        RestartScript()
+    
+    ServiceControl(131) ; サービスの設定リロード
+
+    result := MsgBox("設定をリセットしました。`n新しいマウスを選択しますか？",
+                     "Mouse Wake Suppressor", 0x24)
+    if result = "Yes" {
+        Reload
+    }
 }
 
 ; ──────────────────────────────────────────────
-; 終了時: セッション通知解除 + マウスを必ず有効に戻す
+; アンインストールハンドラー
 ; ──────────────────────────────────────────────
-CleanupOnExit(exitReason, exitCode) {
-    if g_powerNotifyHandle
-        DllCall("UnregisterPowerSettingNotification", "ptr", g_powerNotifyHandle)
-    DllCall("Wtsapi32.dll\WTSUnRegisterSessionNotification", "ptr", A_ScriptHwnd)
-    ForceEnableMouse()
+UninstallServiceMenu() {
+    result := MsgBox("Mouse Wake Suppressor サービスをアンインストールしますか？`n(常駐トレイも終了します)", 
+                     "Mouse Wake Suppressor", 0x24)
+    if result = "Yes" {
+        ServiceUninstall()
+        ExitApp()
+    }
 }
