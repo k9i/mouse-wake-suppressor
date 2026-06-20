@@ -342,6 +342,7 @@ UpdateTray() {
     A_TrayMenu.Add()
 
     A_TrayMenu.Add("設定リセット (mws_config.ini 削除)", ResetConfig)
+    A_TrayMenu.Add("再起動 (スクリプト再起動)", (*) => Reload())
     
     if serviceRunning {
         A_TrayMenu.Add("サービスを停止", (*) => (ServiceStop(), Sleep(300), UpdateTray()))
