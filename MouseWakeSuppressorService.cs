@@ -21,6 +21,7 @@ namespace MouseWakeSuppressor
         private bool _eventSourceCreated = false;
         private Thread windowThread = null;
         private PowerNotificationWindow powerWindow = null;
+        private CancellationTokenSource _startupCts = null;
 
         public MouseWakeSuppressorService()
         {
@@ -32,9 +33,34 @@ namespace MouseWakeSuppressor
         {
             InitEventSource();
             LoadConfig();
+            // 起動直後にマウスを有効に戻し状態ファイルを更新
             RecoverDevicesOnStartup();
             SaveState(true);
 
+            int delaySec = LoadStartupDelay();
+            if (delaySec > 0)
+            {
+                WriteLog(string.Format("電源監視を {0} 秒後に開始します (StartupDelaySec={0})。", delaySec));
+                _startupCts = new CancellationTokenSource();
+                CancellationToken token = _startupCts.Token;
+                Thread t = new Thread(() =>
+                {
+                    for (int i = 0; i < delaySec && !token.IsCancellationRequested; i++)
+                        Thread.Sleep(1000);
+                    if (!token.IsCancellationRequested)
+                        StartMonitoring();
+                });
+                t.IsBackground = true;
+                t.Start();
+            }
+            else
+            {
+                StartMonitoring();
+            }
+        }
+
+        private void StartMonitoring()
+        {
             windowThread = new Thread(() =>
             {
                 powerWindow = new PowerNotificationWindow(
@@ -48,6 +74,13 @@ namespace MouseWakeSuppressor
 
         protected override void OnStop()
         {
+            // 起動遅延中の場合はキャンセル
+            if (_startupCts != null)
+            {
+                _startupCts.Cancel();
+                _startupCts = null;
+            }
+
             if (powerWindow != null)
             {
                 try
@@ -147,6 +180,25 @@ namespace MouseWakeSuppressor
             {
                 WriteLog("Error loading configuration: " + ex.Message, EventLogEntryType.Error);
             }
+        }
+
+        // [Service] StartupDelaySec の値を読む。未設定または 0 以下なら 0 を返す。
+        private int LoadStartupDelay()
+        {
+            try
+            {
+                string exeDir = AppDomain.CurrentDomain.BaseDirectory;
+                string iniPath = Path.Combine(exeDir, "mws_config.ini");
+                if (!File.Exists(iniPath)) return 0;
+
+                StringBuilder sb = new StringBuilder(64);
+                GetPrivateProfileString("Service", "StartupDelaySec", "0", sb, (uint)sb.Capacity, iniPath);
+                int result;
+                if (int.TryParse(sb.ToString().Trim(), out result) && result > 0)
+                    return result;
+            }
+            catch { }
+            return 0;
         }
 
         private void RecoverDevicesOnStartup()
@@ -397,6 +449,8 @@ namespace MouseWakeSuppressor
                     }
                     // 一般ユーザーが sc control でカスタムコマンドを送れるよう DACL を設定
                     SetServiceDacl();
+                    // OS起動時の遅延自動起動を有効化 (Automatic Delayed Start)
+                    SetDelayedAutoStart();
                     // サービスを起動
                     StartService();
                     return;
@@ -453,6 +507,28 @@ namespace MouseWakeSuppressor
             catch (Exception ex)
             {
                 Console.WriteLine("DACL setting error: " + ex.Message);
+            }
+        }
+
+        // OS起動時に Automatic (Delayed Start) として登録する。
+        // これにより他の自動起動サービスが落ち着いた後に起動される。
+        // mws_config.ini の [Service] StartupDelaySec と組み合わせてさらに遅延可能。
+        private static void SetDelayedAutoStart()
+        {
+            try
+            {
+                ProcessStartInfo psi = new ProcessStartInfo("sc",
+                    "config MouseWakeSuppressor start= delayed-auto");
+                psi.CreateNoWindow = true;
+                psi.UseShellExecute = false;
+                using (Process p = Process.Start(psi))
+                {
+                    p.WaitForExit(5000);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Delayed auto start config error: " + ex.Message);
             }
         }
 
