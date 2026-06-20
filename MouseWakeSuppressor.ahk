@@ -6,19 +6,11 @@
 ; 実際のデバイス無効化/有効化および電源イベントの監視は
 ; バックグラウンドで動作する Windows システムサービス "MouseWakeSuppressor" が行います。
 ;
-; 必要権限: 管理者 (サービスのインストール、起動、停止、制御のため)
+; 必要権限: 一般ユーザー権限で動作 (サービスインストール/開始/停止時のみ UAC 昇格)
 ; ホットキー: Win+Shift+M → マウスを手動トグル
 
 #Requires AutoHotkey v2.0-
 #SingleInstance Force
-
-; ──────────────────────────────────────────────
-; 管理者昇格チェック
-; ──────────────────────────────────────────────
-if !A_IsAdmin {
-    Run '*RunAs "' A_AhkPath '" "' A_ScriptFullPath '"'
-    ExitApp
-}
 
 ; ──────────────────────────────────────────────
 ; グローバル変数
@@ -31,17 +23,28 @@ global g_lastState := ""       ; トレイ更新のキャッシュ用
 ; ──────────────────────────────────────────────
 ; サービスのインストール確認と自動開始
 if !IsServiceInstalled() {
-    result := MsgBox("Mouse Wake Suppressor サービスがインストールされていません。`nインストールしますか？ (管理者権限が必要です)", 
+    result := MsgBox("Mouse Wake Suppressor サービスがインストールされていません。`nインストールしますか？ (UAC 昇格が必要です)", 
                      "Mouse Wake Suppressor", 0x24)
     if result = "Yes" {
         ServiceInstall()
+        Sleep(1500)  ; サービス起動を待機
+        if !IsServiceRunning() {
+            MsgBox "サービスの起動に失敗しました。管理者として実行して再試行してください。",
+                   "Mouse Wake Suppressor", 0x10
+            ExitApp
+        }
     } else {
         MsgBox "サービスがインストールされない場合、本スクリプトは動作しません。終了します。", 
                "Mouse Wake Suppressor", 0x10
         ExitApp
     }
 } else if !IsServiceRunning() {
-    ServiceStart()
+    result := MsgBox("サービスが停止しています。起動しますか？ (UAC 昇格が必要です)",
+                     "Mouse Wake Suppressor", 0x24)
+    if result = "Yes" {
+        ServiceStart()
+        Sleep(1000)
+    }
 }
 
 ; 対象デバイスのロード、未設定の場合は GUI 選択
@@ -92,27 +95,36 @@ ServiceInstall() {
         MsgBox "サービス実行ファイルが見つかりません: `n" serviceExe, "Mouse Wake Suppressor", 0x10
         return
     }
-    RunWait '"' serviceExe '" -install',, "Hide"
-    RunWait 'sc start MouseWakeSuppressor',, "Hide"
+    ; -install はサービス登録・DACL設定・起動を内包する。管理者権限で実行。
+    try RunWait '*RunAs "' serviceExe '" -install',, "Hide"
 }
 
 ServiceUninstall() {
     serviceExe := A_ScriptDir "\MouseWakeSuppressorService.exe"
-    RunWait 'sc stop MouseWakeSuppressor',, "Hide"
     if FileExist(serviceExe) {
-        RunWait '"' serviceExe '" -uninstall',, "Hide"
+        ; -uninstall はサービス停止・登録解除を内包する。管理者権限で実行。
+        try RunWait '*RunAs "' serviceExe '" -uninstall',, "Hide"
     }
 }
 
 ServiceStart() {
-    RunWait 'sc start MouseWakeSuppressor',, "Hide"
+    if A_IsAdmin {
+        RunWait 'sc start MouseWakeSuppressor',, "Hide"
+    } else {
+        try RunWait '*RunAs cmd.exe /c "sc start MouseWakeSuppressor"',, "Hide"
+    }
 }
 
 ServiceStop() {
-    RunWait 'sc stop MouseWakeSuppressor',, "Hide"
+    if A_IsAdmin {
+        RunWait 'sc stop MouseWakeSuppressor',, "Hide"
+    } else {
+        try RunWait '*RunAs cmd.exe /c "sc stop MouseWakeSuppressor"',, "Hide"
+    }
 }
 
 ServiceControl(code) {
+    ; サービス DACL により一般ユーザーでも実行可能
     RunWait 'sc control MouseWakeSuppressor ' code,, "Hide"
 }
 

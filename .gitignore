@@ -1,1 +1,5 @@
 *.ini
+*.exe
+*.InstallLog
+*.InstallState
+mws_state.txt

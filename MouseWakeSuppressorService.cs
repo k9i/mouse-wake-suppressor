@@ -16,7 +16,9 @@ namespace MouseWakeSuppressor
     public class MouseWakeSuppressorService : ServiceBase
     {
         private List<string> devices = new List<string>();
-        private bool mouseDisabled = false;
+        private volatile bool mouseDisabled = false;
+        private readonly object _stateLock = new object();
+        private bool _eventSourceCreated = false;
         private Thread windowThread = null;
         private PowerNotificationWindow powerWindow = null;
 
@@ -28,13 +30,16 @@ namespace MouseWakeSuppressor
 
         protected override void OnStart(string[] args)
         {
+            InitEventSource();
             LoadConfig();
             RecoverDevicesOnStartup();
             SaveState(true);
 
             windowThread = new Thread(() =>
             {
-                powerWindow = new PowerNotificationWindow(OnDisplayStateChanged);
+                powerWindow = new PowerNotificationWindow(
+                    OnDisplayStateChanged,
+                    msg => WriteLog(msg, EventLogEntryType.Error));
                 Application.Run(powerWindow);
             });
             windowThread.SetApartmentState(ApartmentState.STA);
@@ -62,7 +67,7 @@ namespace MouseWakeSuppressor
 
         private void OnDisplayStateChanged(int displayState)
         {
-            if (displayState == 0) // Display OFF
+            if (displayState == 0 || displayState == 2) // Display OFF or Dimmed
             {
                 DisableMouse();
             }
@@ -81,6 +86,7 @@ namespace MouseWakeSuppressor
             else if (changeDescription.Reason == SessionChangeReason.SessionLogoff)
             {
                 ForceEnableMouse();
+                SaveState(true);
             }
         }
 
@@ -120,7 +126,7 @@ namespace MouseWakeSuppressor
                     return;
                 }
 
-                StringBuilder sb = new StringBuilder(4096);
+                StringBuilder sb = new StringBuilder(16384);
                 GetPrivateProfileString("Devices", "InstanceIds", "", sb, (uint)sb.Capacity, iniPath);
                 string savedIds = sb.ToString();
 
@@ -150,40 +156,49 @@ namespace MouseWakeSuppressor
 
         private void DisableMouse()
         {
-            if (mouseDisabled) return;
-
-            LoadConfig();
-            if (devices.Count == 0) return;
-
-            foreach (var id in devices)
+            lock (_stateLock)
             {
-                RunPnpUtil("/disable-device \"" + id + "\"");
+                if (mouseDisabled) return;
+
+                LoadConfig();
+                if (devices.Count == 0) return;
+
+                foreach (var id in devices)
+                {
+                    RunPnpUtil("/disable-device \"" + id + "\"");
+                }
+                mouseDisabled = true;
+                SaveState(false);
             }
-            mouseDisabled = true;
-            SaveState(false);
         }
 
         private void EnableMouse()
         {
-            if (!mouseDisabled) return;
-
-            LoadConfig();
-            foreach (var id in devices)
+            lock (_stateLock)
             {
-                RunPnpUtil("/enable-device \"" + id + "\"");
+                if (!mouseDisabled) return;
+
+                LoadConfig();
+                foreach (var id in devices)
+                {
+                    RunPnpUtil("/enable-device \"" + id + "\"");
+                }
+                mouseDisabled = false;
+                SaveState(true);
             }
-            mouseDisabled = false;
-            SaveState(true);
         }
 
         private void ForceEnableMouse()
         {
-            LoadConfig();
-            foreach (var id in devices)
+            lock (_stateLock)
             {
-                RunPnpUtil("/enable-device \"" + id + "\"");
+                LoadConfig();
+                foreach (var id in devices)
+                {
+                    RunPnpUtil("/enable-device \"" + id + "\"");
+                }
+                mouseDisabled = false;
             }
-            mouseDisabled = false;
         }
 
         private void RunPnpUtil(string argument)
@@ -200,6 +215,10 @@ namespace MouseWakeSuppressor
                 using (Process p = Process.Start(psi))
                 {
                     p.WaitForExit(5000);
+                    if (p.ExitCode != 0)
+                    {
+                        WriteLog(string.Format("pnputil {0} exited with code {1}.", argument, p.ExitCode), EventLogEntryType.Warning);
+                    }
                 }
             }
             catch (Exception ex)
@@ -219,7 +238,7 @@ namespace MouseWakeSuppressor
             catch { }
         }
 
-        private void WriteLog(string message, EventLogEntryType type = EventLogEntryType.Information)
+        private void InitEventSource()
         {
             try
             {
@@ -227,6 +246,16 @@ namespace MouseWakeSuppressor
                 {
                     EventLog.CreateEventSource("MouseWakeSuppressor", "Application");
                 }
+                _eventSourceCreated = true;
+            }
+            catch { }
+        }
+
+        private void WriteLog(string message, EventLogEntryType type = EventLogEntryType.Information)
+        {
+            if (!_eventSourceCreated) return;
+            try
+            {
                 EventLog.WriteEntry("MouseWakeSuppressor", message, type);
             }
             catch { }
@@ -260,10 +289,12 @@ namespace MouseWakeSuppressor
 
         private IntPtr powerNotifyHandle = IntPtr.Zero;
         private Action<int> onDisplayStateChanged = null;
+        private Action<string> onError = null;
 
-        public PowerNotificationWindow(Action<int> callback)
+        public PowerNotificationWindow(Action<int> callback, Action<string> errorCallback = null)
         {
             this.onDisplayStateChanged = callback;
+            this.onError = errorCallback;
             this.FormBorderStyle = FormBorderStyle.None;
             this.ShowInTaskbar = false;
             this.WindowState = FormWindowState.Minimized;
@@ -275,10 +306,18 @@ namespace MouseWakeSuppressor
             base.OnHandleCreated(e);
             try
             {
+                var guid = GUID_CONSOLE_DISPLAY_STATE;
                 powerNotifyHandle = RegisterPowerSettingNotification(
                     this.Handle,
-                    ref GUID_CONSOLE_DISPLAY_STATE,
+                    ref guid,
                     DEVICE_NOTIFY_WINDOW_HANDLE);
+
+                if (powerNotifyHandle == IntPtr.Zero)
+                {
+                    int error = Marshal.GetLastWin32Error();
+                    if (onError != null)
+                        onError("RegisterPowerSettingNotification failed. Win32 error: " + error);
+                }
             }
             catch { }
         }
@@ -354,11 +393,18 @@ namespace MouseWakeSuppressor
                     catch (Exception ex)
                     {
                         Console.WriteLine("Installation error: " + ex.Message);
+                        return;
                     }
+                    // 一般ユーザーが sc control でカスタムコマンドを送れるよう DACL を設定
+                    SetServiceDacl();
+                    // サービスを起動
+                    StartService();
                     return;
                 }
                 else if (cmd == "-uninstall" || cmd == "/u")
                 {
+                    // アンインストール前にサービスを停止
+                    StopService();
                     try
                     {
                         ManagedInstallerClass.InstallHelper(new string[] { "/u", Assembly.GetExecutingAssembly().Location });
@@ -373,6 +419,83 @@ namespace MouseWakeSuppressor
             }
 
             ServiceBase.Run(new MouseWakeSuppressorService());
+        }
+
+        // 一般ユーザー (Users グループ) がサービスの状態照会とカスタムコマンドを
+        // 送信できるよう DACL を設定する。管理者でのインストール時に一度だけ実行。
+        private static void SetServiceDacl()
+        {
+            try
+            {
+                // BU (Builtin Users) に CC+LC+SW+LO+CR+RC を付与:
+                //   CC = SERVICE_QUERY_CONFIG
+                //   LC = SERVICE_QUERY_STATUS
+                //   SW = SERVICE_ENUMERATE_DEPENDENTS
+                //   LO = SERVICE_INTERROGATE
+                //   CR = SERVICE_USER_DEFINED_CONTROL  ← sc control に必要
+                //   RC = READ_CONTROL
+                const string dacl =
+                    "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)" +
+                    "(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)" +
+                    "(A;;CCLCSWLOCRRC;;;IU)" +
+                    "(A;;CCLCSWLOCRRC;;;SU)" +
+                    "(A;;CCLCSWLOCRRC;;;BU)";
+
+                ProcessStartInfo psi = new ProcessStartInfo("sc",
+                    "sdset MouseWakeSuppressor " + dacl);
+                psi.CreateNoWindow = true;
+                psi.UseShellExecute = false;
+                using (Process p = Process.Start(psi))
+                {
+                    p.WaitForExit(5000);
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("DACL setting error: " + ex.Message);
+            }
+        }
+
+        private static void StartService()
+        {
+            try
+            {
+                using (System.ServiceProcess.ServiceController sc =
+                    new System.ServiceProcess.ServiceController("MouseWakeSuppressor"))
+                {
+                    if (sc.Status != System.ServiceProcess.ServiceControllerStatus.Running)
+                    {
+                        sc.Start();
+                        sc.WaitForStatus(
+                            System.ServiceProcess.ServiceControllerStatus.Running,
+                            TimeSpan.FromSeconds(10));
+                        Console.WriteLine("Service started.");
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                Console.WriteLine("Service start error: " + ex.Message);
+            }
+        }
+
+        private static void StopService()
+        {
+            try
+            {
+                using (System.ServiceProcess.ServiceController sc =
+                    new System.ServiceProcess.ServiceController("MouseWakeSuppressor"))
+                {
+                    if (sc.Status == System.ServiceProcess.ServiceControllerStatus.Running)
+                    {
+                        sc.Stop();
+                        sc.WaitForStatus(
+                            System.ServiceProcess.ServiceControllerStatus.Stopped,
+                            TimeSpan.FromSeconds(10));
+                    }
+                }
+            }
+            catch { }
         }
     }
 }
