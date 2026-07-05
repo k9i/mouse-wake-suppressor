@@ -94,7 +94,7 @@ namespace MouseWakeSuppressor
                 windowThread.Join(2000);
             }
 
-            ForceEnableMouse();
+            ForceEnableMouse("サービス停止");
             SaveState(true);
         }
 
@@ -102,11 +102,11 @@ namespace MouseWakeSuppressor
         {
             if (displayState == 0 || displayState == 2) // Display OFF or Dimmed
             {
-                DisableMouse();
+                DisableMouse("ディスプレイ消灯 (状態=" + displayState + ")");
             }
             else if (displayState == 1) // Display ON
             {
-                EnableMouse();
+                EnableMouse("ディスプレイ点灯");
             }
         }
 
@@ -114,11 +114,15 @@ namespace MouseWakeSuppressor
         {
             if (changeDescription.Reason == SessionChangeReason.SessionUnlock)
             {
-                EnableMouse();
+                EnableMouse("セッションアンロック");
+            }
+            else if (changeDescription.Reason == SessionChangeReason.SessionLock)
+            {
+                DisableMouse("セッションロック");
             }
             else if (changeDescription.Reason == SessionChangeReason.SessionLogoff)
             {
-                ForceEnableMouse();
+                ForceEnableMouse("セッションログオフ");
                 SaveState(true);
             }
         }
@@ -128,17 +132,17 @@ namespace MouseWakeSuppressor
             if (command == 128) // Toggle
             {
                 if (mouseDisabled)
-                    EnableMouse();
+                    EnableMouse("手動トグル (コマンド128)");
                 else
-                    DisableMouse();
+                    DisableMouse("手動トグル (コマンド128)");
             }
             else if (command == 129) // Enable
             {
-                EnableMouse();
+                EnableMouse("手動有効化 (コマンド129)");
             }
             else if (command == 130) // Disable
             {
-                DisableMouse();
+                DisableMouse("手動無効化 (コマンド130)");
             }
             else if (command == 131) // Reload Config
             {
@@ -203,10 +207,10 @@ namespace MouseWakeSuppressor
 
         private void RecoverDevicesOnStartup()
         {
-            ForceEnableMouse();
+            ForceEnableMouse("サービス起動時の復旧");
         }
 
-        private void DisableMouse()
+        private void DisableMouse(string reason = "")
         {
             lock (_stateLock)
             {
@@ -215,6 +219,7 @@ namespace MouseWakeSuppressor
                 LoadConfig();
                 if (devices.Count == 0) return;
 
+                WriteLog("マウス無効化: " + (string.IsNullOrEmpty(reason) ? "不明" : reason));
                 foreach (var id in devices)
                 {
                     RunPnpUtil("/disable-device \"" + id + "\"");
@@ -224,13 +229,14 @@ namespace MouseWakeSuppressor
             }
         }
 
-        private void EnableMouse()
+        private void EnableMouse(string reason = "")
         {
             lock (_stateLock)
             {
                 if (!mouseDisabled) return;
 
                 LoadConfig();
+                WriteLog("マウス有効化: " + (string.IsNullOrEmpty(reason) ? "不明" : reason));
                 foreach (var id in devices)
                 {
                     RunPnpUtil("/enable-device \"" + id + "\"");
@@ -240,11 +246,12 @@ namespace MouseWakeSuppressor
             }
         }
 
-        private void ForceEnableMouse()
+        private void ForceEnableMouse(string reason = "")
         {
             lock (_stateLock)
             {
                 LoadConfig();
+                WriteLog("マウス強制有効化: " + (string.IsNullOrEmpty(reason) ? "不明" : reason));
                 foreach (var id in devices)
                 {
                     RunPnpUtil("/enable-device \"" + id + "\"");

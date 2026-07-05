@@ -17,6 +17,7 @@
 ; ──────────────────────────────────────────────
 global g_devices := []         ; [{id: "HID\...", name: "..."}, ...]
 global g_lastState := ""       ; トレイ更新のキャッシュ用
+global g_powerNotifyHandle := 0 ; RegisterPowerSettingNotification の戻り値
 
 ; ──────────────────────────────────────────────
 ; 初期化
@@ -79,6 +80,38 @@ SetTimer(UpdateTray, 1000)
     Sleep(150)
     UpdateTray()
 }
+
+; ──────────────────────────────────────────────
+; 画面ロック・消灯の検出 (試験的実装)
+; サービスは Session 0 (SYSTEM) で動作するため、ユーザーセッションの
+; 画面ロック・消灯イベントを受信できない場合がある。
+; このスクリプトはユーザーセッション内で直接検出し、サービス経由で pnputil を実行する。
+; ──────────────────────────────────────────────
+
+; セッション変更通知を登録 (画面ロック/アンロック検出)
+DllCall("Wtsapi32\WTSRegisterSessionNotification", "Ptr", A_ScriptHwnd, "UInt", 0)
+
+; GUID_CONSOLE_DISPLAY_STATE でディスプレイ電源状態通知を登録
+; {6fe69556-704a-47a0-8f24-c2c28d936fda}
+_guidBuf := Buffer(16, 0)
+NumPut("UInt",   0x6fe69556, _guidBuf,  0)
+NumPut("UShort", 0x704a,     _guidBuf,  4)
+NumPut("UShort", 0x47a0,     _guidBuf,  6)
+NumPut("UChar",  0x8f,       _guidBuf,  8)
+NumPut("UChar",  0x24,       _guidBuf,  9)
+NumPut("UChar",  0xc2,       _guidBuf, 10)
+NumPut("UChar",  0xc2,       _guidBuf, 11)
+NumPut("UChar",  0x8d,       _guidBuf, 12)
+NumPut("UChar",  0x93,       _guidBuf, 13)
+NumPut("UChar",  0x6f,       _guidBuf, 14)
+NumPut("UChar",  0xda,       _guidBuf, 15)
+g_powerNotifyHandle := DllCall("user32\RegisterPowerSettingNotification",
+    "Ptr", A_ScriptHwnd, "Ptr", _guidBuf.Ptr, "UInt", 0, "Ptr")
+
+OnMessage(0x2B1, OnWtsSessionChange)  ; WM_WTSSESSION_CHANGE
+OnMessage(0x218, OnPowerBroadcast)    ; WM_POWERBROADCAST
+
+OnExit(CleanupNotifications)
 
 ; ──────────────────────────────────────────────
 ; サービス制御用ヘルパー
@@ -391,4 +424,52 @@ UninstallServiceMenu() {
         ServiceUninstall()
         ExitApp()
     }
+}
+
+; ──────────────────────────────────────────────
+; セッション変更ハンドラ (画面ロック/アンロック)
+; ──────────────────────────────────────────────
+OnWtsSessionChange(wParam, lParam, msg, hwnd) {
+    if wParam = 7 {        ; WTS_SESSION_LOCK
+        ServiceControl(130) ; マウス無効化
+        Sleep(150)
+        UpdateTray()
+    } else if wParam = 8 { ; WTS_SESSION_UNLOCK
+        ServiceControl(129) ; マウス有効化
+        Sleep(150)
+        UpdateTray()
+    } else if wParam = 6 { ; WTS_SESSION_LOGOFF
+        ServiceControl(129) ; マウス強制有効化 (コマンド129=Enable)
+        Sleep(150)
+        UpdateTray()
+    }
+}
+
+; ──────────────────────────────────────────────
+; 電源ブロードキャストハンドラ (ディスプレイ消灯/点灯)
+; ──────────────────────────────────────────────
+OnPowerBroadcast(wParam, lParam, msg, hwnd) {
+    if wParam = 0x8013 && lParam != 0 { ; PBT_POWERSETTINGCHANGE
+        ; POWERBROADCAST_SETTING 構造体: GUID(16B) + DataLength(4B) + Data
+        displayState := NumGet(lParam, 20, "UInt")
+        if displayState = 0 or displayState = 2 { ; OFF or Dimmed
+            ServiceControl(130) ; マウス無効化
+            Sleep(150)
+            UpdateTray()
+        } else if displayState = 1 {               ; ON
+            ServiceControl(129) ; マウス有効化
+            Sleep(150)
+            UpdateTray()
+        }
+    }
+}
+
+; ──────────────────────────────────────────────
+; 終了時のクリーンアップ
+; ──────────────────────────────────────────────
+CleanupNotifications(exitReason, exitCode) {
+    global g_powerNotifyHandle
+    DllCall("Wtsapi32\WTSUnRegisterSessionNotification", "Ptr", A_ScriptHwnd)
+    if g_powerNotifyHandle
+        DllCall("user32\UnregisterPowerSettingNotification", "Ptr", g_powerNotifyHandle)
 }
