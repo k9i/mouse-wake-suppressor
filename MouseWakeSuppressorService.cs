@@ -276,7 +276,14 @@ namespace MouseWakeSuppressor
                     p.WaitForExit(5000);
                     if (p.ExitCode != 0)
                     {
-                        WriteLog(string.Format("pnputil {0} exited with code {1}.", argument, p.ExitCode), EventLogEntryType.Warning);
+                        if (p.ExitCode == 50 && argument.StartsWith("/enable-device")) // exit code 50 は already enabled
+                        {
+                            WriteLog(string.Format("pnputil {0} exited with code 50 (already enabled).", argument), EventLogEntryType.Information);
+                        }
+                        else
+                        {
+                            WriteLog(string.Format("pnputil {0} exited with code {1}.", argument, p.ExitCode), EventLogEntryType.Warning);
+                        }
                     }
                 }
             }
