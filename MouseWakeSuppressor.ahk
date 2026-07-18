@@ -404,9 +404,14 @@ UpdateTray() {
         TraySetIcon "shell32.dll", 110
         A_IconTip := "Mouse Wake Suppressor`nService is NOT running!"
     }
-
     A_TrayMenu.Delete()
-
+    A_TrayMenu.AddStandard()
+    try {
+      A_TrayMenu.Delete("&Help")
+      A_TrayMenu.Delete("&Window Spy")
+      A_TrayMenu.Delete("&Pause Script")
+    }
+    A_TrayMenu.Add() ; セパレータライン
     if currentState == "DISABLED" {
         A_TrayMenu.Add("Mouse: DISABLED (-> to Enable)", (*) => (ServiceControl(128), Sleep(150), UpdateTray()))
         A_TrayMenu.Default := "Mouse: DISABLED (-> to Enable)"
@@ -431,15 +436,14 @@ UpdateTray() {
     A_TrayMenu.Add()
 
     A_TrayMenu.Add("設定リセット (mws_config.ini 削除)", ResetConfig)
-    A_TrayMenu.Add("再起動 (スクリプト再起動)", (*) => Reload())
     
     if serviceRunning {
-        A_TrayMenu.Add("サービスを停止", (*) => (ServiceStop(), Sleep(300), UpdateTray()))
-        A_TrayMenu.Add("サービスを再起動", (*) => (ServiceStop(), Sleep(500), ServiceStart(), Sleep(300), UpdateTray()))
+        A_TrayMenu.Add("サービスを停止(要管理者権限)", (*) => (ServiceStop(), Sleep(300), UpdateTray()))
+        A_TrayMenu.Add("サービスを再起動(要管理者権限)", (*) => (ServiceStop(), Sleep(500), ServiceStart(), Sleep(300), UpdateTray()))
     } else {
-        A_TrayMenu.Add("サービスを開始", (*) => (ServiceStart(), Sleep(300), UpdateTray()))
+        A_TrayMenu.Add("サービスを開始(要管理者権限)", (*) => (ServiceStart(), Sleep(300), UpdateTray()))
     }
-    A_TrayMenu.Add("サービスをアンインストール", (*) => UninstallServiceMenu())
+    A_TrayMenu.Add("サービスをアンインストール(要管理者権限)", (*) => UninstallServiceMenu())
     A_TrayMenu.Add()
     A_TrayMenu.Add("終了 (常駐トレイを閉じる)", (*) => ExitApp())
 }
