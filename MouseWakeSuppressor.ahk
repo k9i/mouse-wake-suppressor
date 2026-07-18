@@ -17,7 +17,10 @@
 ; ──────────────────────────────────────────────
 global g_devices := []         ; [{id: "HID\...", name: "..."}, ...]
 global g_lastState := ""       ; トレイ更新のキャッシュ用
-global g_powerNotifyHandle := 0 ; RegisterPowerSettingNotification の戻り値
+global g_powerNotifyHandles := [] ; RegisterPowerSettingNotification の戻り値
+global g_sessionDisplayNotificationSeen := false ; セッション表示通知を受信済みか
+global g_consoleDisplayGuid := "{6FE69556-704A-47A0-8F24-C2C28D936FDA}"
+global g_sessionDisplayGuid := "{2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5}"
 
 ; ──────────────────────────────────────────────
 ; 初期化
@@ -91,22 +94,10 @@ SetTimer(UpdateTray, 1000)
 ; セッション変更通知を登録 (画面ロック/アンロック検出)
 DllCall("Wtsapi32\WTSRegisterSessionNotification", "Ptr", A_ScriptHwnd, "UInt", 0)
 
-; GUID_CONSOLE_DISPLAY_STATE でディスプレイ電源状態通知を登録
-; {6fe69556-704a-47a0-8f24-c2c28d936fda}
-_guidBuf := Buffer(16, 0)
-NumPut("UInt",   0x6fe69556, _guidBuf,  0)
-NumPut("UShort", 0x704a,     _guidBuf,  4)
-NumPut("UShort", 0x47a0,     _guidBuf,  6)
-NumPut("UChar",  0x8f,       _guidBuf,  8)
-NumPut("UChar",  0x24,       _guidBuf,  9)
-NumPut("UChar",  0xc2,       _guidBuf, 10)
-NumPut("UChar",  0xc2,       _guidBuf, 11)
-NumPut("UChar",  0x8d,       _guidBuf, 12)
-NumPut("UChar",  0x93,       _guidBuf, 13)
-NumPut("UChar",  0x6f,       _guidBuf, 14)
-NumPut("UChar",  0xda,       _guidBuf, 15)
-g_powerNotifyHandle := DllCall("user32\RegisterPowerSettingNotification",
-    "Ptr", A_ScriptHwnd, "Ptr", _guidBuf.Ptr, "UInt", 0, "Ptr")
+; ユーザーセッションの表示状態を主経路として購読する。
+; GUID_CONSOLE_DISPLAY_STATE も、セッション通知が届かない環境用の
+; フォールバックとして併せて購読する。
+RegisterDisplayPowerNotifications()
 
 OnMessage(0x2B1, OnWtsSessionChange)  ; WM_WTSSESSION_CHANGE
 OnMessage(0x218, OnPowerBroadcast)    ; WM_POWERBROADCAST
@@ -168,6 +159,62 @@ ServiceStop() {
 ServiceControl(code) {
     ; サービス DACL により一般ユーザーでも実行可能
     RunWait 'sc control MouseWakeSuppressor ' code,, "Hide"
+}
+
+; ──────────────────────────────────────────────
+; ディスプレイ電源通知の登録
+; ──────────────────────────────────────────────
+RegisterDisplayPowerNotifications() {
+    global g_powerNotifyHandles, g_consoleDisplayGuid, g_sessionDisplayGuid
+
+    sessionHandle := RegisterPowerNotification(g_sessionDisplayGuid)
+    consoleHandle := RegisterPowerNotification(g_consoleDisplayGuid)
+
+    if !sessionHandle && !consoleHandle {
+        MsgBox "ディスプレイ電源状態の通知を登録できませんでした。`n"
+             . "自動消灯時のマウス無効化は動作しない可能性があります。",
+               "Mouse Wake Suppressor", 0x30
+    }
+}
+
+RegisterPowerNotification(guid) {
+    global g_powerNotifyHandles
+
+    guidBuf := GuidToBuffer(guid)
+    handle := DllCall("user32\RegisterPowerSettingNotification",
+        "Ptr", A_ScriptHwnd, "Ptr", guidBuf.Ptr, "UInt", 0, "Ptr")
+    if handle
+        g_powerNotifyHandles.Push(handle)
+    return handle
+}
+
+GuidToBuffer(guid) {
+    guid := Trim(guid, "{}")
+    parts := StrSplit(guid, "-")
+    if parts.Length != 5
+        throw ValueError("Invalid GUID: " guid)
+
+    data4 := parts[4] parts[5]
+    if StrLen(data4) != 16
+        throw ValueError("Invalid GUID: " guid)
+
+    guidBuf := Buffer(16, 0)
+    NumPut("UInt", "0x" parts[1], guidBuf, 0)
+    NumPut("UShort", "0x" parts[2], guidBuf, 4)
+    NumPut("UShort", "0x" parts[3], guidBuf, 6)
+    Loop 8
+        NumPut("UChar", "0x" SubStr(data4, (A_Index - 1) * 2 + 1, 2), guidBuf, A_Index + 7)
+    return guidBuf
+}
+
+GuidMatches(ptr, guid) {
+    guidBuf := GuidToBuffer(guid)
+    Loop 16 {
+        offset := A_Index - 1
+        if NumGet(ptr, offset, "UChar") != NumGet(guidBuf, offset, "UChar")
+            return false
+    }
+    return true
 }
 
 GetMouseStateFromService() {
@@ -449,8 +496,24 @@ OnWtsSessionChange(wParam, lParam, msg, hwnd) {
 ; 電源ブロードキャストハンドラ (ディスプレイ消灯/点灯)
 ; ──────────────────────────────────────────────
 OnPowerBroadcast(wParam, lParam, msg, hwnd) {
+    global g_consoleDisplayGuid, g_sessionDisplayGuid, g_sessionDisplayNotificationSeen
+
     if wParam = 0x8013 && lParam != 0 { ; PBT_POWERSETTINGCHANGE
         ; POWERBROADCAST_SETTING 構造体: GUID(16B) + DataLength(4B) + Data
+        dataLength := NumGet(lParam, 16, "UInt")
+        if dataLength < 4
+            return
+
+        if GuidMatches(lParam, g_sessionDisplayGuid) {
+            g_sessionDisplayNotificationSeen := true
+        } else if GuidMatches(lParam, g_consoleDisplayGuid) {
+            ; セッション通知が利用できる場合は、そのセッション固有の状態を優先する。
+            if g_sessionDisplayNotificationSeen
+                return
+        } else {
+            return
+        }
+
         displayState := NumGet(lParam, 20, "UInt")
         if displayState = 0 or displayState = 2 { ; OFF or Dimmed
             ServiceControl(130) ; マウス無効化
@@ -468,8 +531,10 @@ OnPowerBroadcast(wParam, lParam, msg, hwnd) {
 ; 終了時のクリーンアップ
 ; ──────────────────────────────────────────────
 CleanupNotifications(exitReason, exitCode) {
-    global g_powerNotifyHandle
+    global g_powerNotifyHandles
     DllCall("Wtsapi32\WTSUnRegisterSessionNotification", "Ptr", A_ScriptHwnd)
-    if g_powerNotifyHandle
-        DllCall("user32\UnregisterPowerSettingNotification", "Ptr", g_powerNotifyHandle)
+    for handle in g_powerNotifyHandles {
+        if handle
+            DllCall("user32\UnregisterPowerSettingNotification", "Ptr", handle)
+    }
 }
