@@ -62,25 +62,11 @@ if g_devices.Length = 0 {
 ; トレイアイコンとメニューの初期表示
 UpdateTray()
 
-; 1秒おきにサービスの状態を監視してトレイアイコンを自動同期
-SetTimer(UpdateTray, 1000)
-
 ; ──────────────────────────────────────────────
 ; ホットキー: Win+Shift+M → 手動トグル
 ; ──────────────────────────────────────────────
 #+m:: {
-    ServiceControl(128) ; トグル
-    Sleep(150)
-    UpdateTray()
-}
-
-; ──────────────────────────────────────────────
-; ホットキー: Shift+Alt+Ctrl+F1 → 手動トグル
-; ──────────────────────────────────────────────
-^!+F1:: {
-    ServiceControl(128) ; トグル
-    Sleep(150)
-    UpdateTray()
+    ManualToggleMouse()
 }
 
 ; ──────────────────────────────────────────────
@@ -221,6 +207,36 @@ GetMouseStateFromService() {
             return "DISABLED"
     }
     return "UNKNOWN"
+}
+
+ManualToggleMouse(*) {
+    global g_devices
+
+    previousState := GetMouseStateFromService()
+    ServiceControl(128)
+    timeoutMs := Max(6000, g_devices.Length * 5000 + 1000)
+
+    ; command の受付だけでは device 操作の完了を保証できないため、状態遷移を待つ。
+    if previousState == "ENABLED" {
+        if WaitForMouseState("DISABLED", timeoutMs)
+            TrayTip("マウスを手動で無効化しました。", "Mouse Wake Suppressor", 1)
+    } else if previousState == "DISABLED" {
+        WaitForMouseState("ENABLED", timeoutMs)
+    } else {
+        Sleep(150) ; 既存状態が不明な場合は誤通知を避ける
+    }
+
+    UpdateTray()
+}
+
+WaitForMouseState(expectedState, timeoutMs) {
+    startTime := DllCall("Kernel32\GetTickCount64", "UInt64")
+    while DllCall("Kernel32\GetTickCount64", "UInt64") - startTime < timeoutMs {
+        if GetMouseStateFromService() == expectedState
+            return true
+        Sleep(50)
+    }
+    return false
 }
 
 ; ──────────────────────────────────────────────
@@ -405,10 +421,10 @@ UpdateTray() {
     }
     A_TrayMenu.Add() ; セパレータライン
     if currentState == "DISABLED" {
-        A_TrayMenu.Add("Mouse: DISABLED (-> to Enable)", (*) => (ServiceControl(128), Sleep(150), UpdateTray()))
+        A_TrayMenu.Add("Mouse: DISABLED (-> to Enable)", ManualToggleMouse)
         A_TrayMenu.Default := "Mouse: DISABLED (-> to Enable)"
     } else if currentState == "ENABLED" {
-        A_TrayMenu.Add("Mouse: ENABLED (-> to Disable)", (*) => (ServiceControl(128), Sleep(150), UpdateTray()))
+        A_TrayMenu.Add("Mouse: ENABLED (-> to Disable)", ManualToggleMouse)
         A_TrayMenu.Default := "Mouse: ENABLED (-> to Disable)"
     } else if currentState == "STOPPED" {
         A_TrayMenu.Add("サービスが停止しています (開始する)", (*) => (ServiceStart(), Sleep(500), UpdateTray()))
