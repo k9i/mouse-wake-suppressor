@@ -3,8 +3,7 @@
 ; マウス移動によるモニター点灯やスリープ解除を防ぐ AHK v2 スクリプト
 ;
 ; このスクリプトは、設定 GUI、トレイアイコン、手動トグルのホットキーを管理し、
-; 実際のデバイス無効化/有効化および電源イベントの監視は
-; バックグラウンドで動作する Windows システムサービス "MouseWakeSuppressor" が行います。
+; display state を監視し、デバイス状態を管理する Windows システムサービスへ通知します。
 ;
 ; 必要権限: 一般ユーザー権限で動作 (サービスインストール/開始/停止時のみ UAC 昇格)
 ; ホットキー: Win+Shift+M → マウスを手動トグル
@@ -27,7 +26,7 @@ global g_sessionDisplayGuid := "{2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5}"
 ; ──────────────────────────────────────────────
 ; サービスのインストール確認と自動開始
 if !IsServiceInstalled() {
-    result := MsgBox("Mouse Wake Suppressor サービスがインストールされていません。`nインストールしますか？ (UAC 昇格が必要です)", 
+    result := MsgBox("Mouse Wake Suppressor サービスがインストールされていません。`nインストールしますか？ (UAC 昇格が必要です)",
                      "Mouse Wake Suppressor", 0x24)
     if result = "Yes" {
         ServiceInstall()
@@ -38,7 +37,7 @@ if !IsServiceInstalled() {
             ExitApp
         }
     } else {
-        MsgBox "サービスがインストールされない場合、本スクリプトは動作しません。終了します。", 
+        MsgBox "サービスがインストールされない場合、本スクリプトは動作しません。終了します。",
                "Mouse Wake Suppressor", 0x10
         ExitApp
     }
@@ -85,21 +84,14 @@ SetTimer(UpdateTray, 1000)
 }
 
 ; ──────────────────────────────────────────────
-; 画面ロック・消灯の検出 (試験的実装)
-; サービスは Session 0 (SYSTEM) で動作するため、ユーザーセッションの
-; 画面ロック・消灯イベントを受信できない場合がある。
-; このスクリプトはユーザーセッション内で直接検出し、サービス経由で pnputil を実行する。
+; ユーザーセッションの display state を検出し、service に状態遷移を通知する。
 ; ──────────────────────────────────────────────
-
-; セッション変更通知を登録 (画面ロック/アンロック検出)
-DllCall("Wtsapi32\WTSRegisterSessionNotification", "Ptr", A_ScriptHwnd, "UInt", 0)
 
 ; ユーザーセッションの表示状態を主経路として購読する。
 ; GUID_CONSOLE_DISPLAY_STATE も、セッション通知が届かない環境用の
 ; フォールバックとして併せて購読する。
 RegisterDisplayPowerNotifications()
 
-OnMessage(0x2B1, OnWtsSessionChange)  ; WM_WTSSESSION_CHANGE
 OnMessage(0x218, OnPowerBroadcast)    ; WM_POWERBROADCAST
 
 OnExit(CleanupNotifications)
@@ -384,7 +376,7 @@ UpdateTray() {
 
     currentState := GetMouseStateFromService()
     serviceRunning := IsServiceRunning()
-    
+
     if !serviceRunning {
         currentState := "STOPPED"
     }
@@ -435,8 +427,8 @@ UpdateTray() {
     }
     A_TrayMenu.Add()
 
-    A_TrayMenu.Add("設定リセット (mws_config.ini 削除)", ResetConfig)
-    
+    A_TrayMenu.Add("マウス設定をリセット", ResetConfig)
+
     if serviceRunning {
         A_TrayMenu.Add("サービスを停止(要管理者権限)", (*) => (ServiceStop(), Sleep(300), UpdateTray()))
         A_TrayMenu.Add("サービスを再起動(要管理者権限)", (*) => (ServiceStop(), Sleep(500), ServiceStart(), Sleep(300), UpdateTray()))
@@ -454,11 +446,11 @@ UpdateTray() {
 ResetConfig(*) {
     configFile := A_ScriptDir "\mws_config.ini"
     if FileExist(configFile)
-        FileDelete(configFile)
-    
+        IniDelete(configFile, "Devices") ; service 設定を保持して device 選択だけを消去
+
     ServiceControl(131) ; サービスの設定リロード
 
-    result := MsgBox("設定をリセットしました。`n新しいマウスを選択しますか？",
+    result := MsgBox("マウス設定をリセットしました。`n新しいマウスを選択しますか？",
                      "Mouse Wake Suppressor", 0x24)
     if result = "Yes" {
         Reload
@@ -469,30 +461,11 @@ ResetConfig(*) {
 ; アンインストールハンドラー
 ; ──────────────────────────────────────────────
 UninstallServiceMenu() {
-    result := MsgBox("Mouse Wake Suppressor サービスをアンインストールしますか？`n(常駐トレイも終了します)", 
+    result := MsgBox("Mouse Wake Suppressor サービスをアンインストールしますか？`n(常駐トレイも終了します)",
                      "Mouse Wake Suppressor", 0x24)
     if result = "Yes" {
         ServiceUninstall()
         ExitApp()
-    }
-}
-
-; ──────────────────────────────────────────────
-; セッション変更ハンドラ (画面ロック/アンロック)
-; ──────────────────────────────────────────────
-OnWtsSessionChange(wParam, lParam, msg, hwnd) {
-    if wParam = 7 {        ; WTS_SESSION_LOCK
-        ServiceControl(130) ; マウス無効化
-        Sleep(150)
-        UpdateTray()
-    } else if wParam = 8 { ; WTS_SESSION_UNLOCK
-        ServiceControl(129) ; マウス有効化
-        Sleep(150)
-        UpdateTray()
-    } else if wParam = 6 { ; WTS_SESSION_LOGOFF
-        ServiceControl(129) ; マウス強制有効化 (コマンド129=Enable)
-        Sleep(150)
-        UpdateTray()
     }
 }
 
@@ -520,7 +493,7 @@ OnPowerBroadcast(wParam, lParam, msg, hwnd) {
 
         displayState := NumGet(lParam, 20, "UInt")
         if displayState = 0 or displayState = 2 { ; OFF or Dimmed
-            ServiceControl(130) ; マウス無効化
+            ServiceControl(132) ; service に自動無効化を予約
             Sleep(150)
             UpdateTray()
         } else if displayState = 1 {               ; ON
@@ -536,7 +509,6 @@ OnPowerBroadcast(wParam, lParam, msg, hwnd) {
 ; ──────────────────────────────────────────────
 CleanupNotifications(exitReason, exitCode) {
     global g_powerNotifyHandles
-    DllCall("Wtsapi32\WTSUnRegisterSessionNotification", "Ptr", A_ScriptHwnd)
     for handle in g_powerNotifyHandles {
         if handle
             DllCall("user32\UnregisterPowerSettingNotification", "Ptr", handle)

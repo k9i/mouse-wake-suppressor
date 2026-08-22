@@ -7,7 +7,7 @@ if not exist "%CSC%" (
     echo Please install .NET Framework 4.x and retry.
     exit /b 1
 )
-"%CSC%" /target:exe /out:"%DIR%MouseWakeSuppressorService.exe" /reference:System.ServiceProcess.dll,System.dll,System.Configuration.Install.dll,System.Windows.Forms.dll,System.Drawing.dll "%DIR%MouseWakeSuppressorService.cs"
+"%CSC%" /target:exe /out:"%DIR%MouseWakeSuppressorService.exe" /reference:System.ServiceProcess.dll,System.dll,System.Configuration.Install.dll "%DIR%MouseWakeSuppressorService.cs"
 set BUILD_EXIT=!ERRORLEVEL!
 if !BUILD_EXIT! neq 0 (
     echo BUILD FAILED - exit code !BUILD_EXIT!

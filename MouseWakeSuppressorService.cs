@@ -9,7 +9,6 @@ using System.ComponentModel;
 using System.Configuration.Install;
 using System.Reflection;
 using System.Threading;
-using System.Windows.Forms;
 
 namespace MouseWakeSuppressor
 {
@@ -19,10 +18,12 @@ namespace MouseWakeSuppressor
         private volatile bool mouseDisabled = false;
         private readonly object _stateLock = new object();
         private bool _eventSourceCreated = false;
-        private Thread windowThread = null;
-        private PowerNotificationWindow powerWindow = null;
-        private CancellationTokenSource _startupCts = null;
+        private const int DefaultAutomaticDisableDelayMilliseconds = 5000;
+        private int _automaticDisableDelayMilliseconds = DefaultAutomaticDisableDelayMilliseconds;
+        private Timer _automaticDisableTimer = null;
+        private long _automaticDisableGeneration = 0;
 
+        /// <summary>サービスの基本属性を初期化します。</summary>
         public MouseWakeSuppressorService()
         {
             this.ServiceName = "MouseWakeSuppressor";
@@ -36,78 +37,12 @@ namespace MouseWakeSuppressor
             // 起動直後にマウスを有効に戻し状態ファイルを更新
             RecoverDevicesOnStartup();
             SaveState(true);
-
-            int delaySec = LoadStartupDelay();
-            if (delaySec > 0)
-            {
-                WriteLog(string.Format("電源監視を {0} 秒後に開始します (StartupDelaySec={0})。", delaySec));
-                _startupCts = new CancellationTokenSource();
-                CancellationToken token = _startupCts.Token;
-                Thread t = new Thread(() =>
-                {
-                    for (int i = 0; i < delaySec && !token.IsCancellationRequested; i++)
-                        Thread.Sleep(1000);
-                    if (!token.IsCancellationRequested)
-                        StartMonitoring();
-                });
-                t.IsBackground = true;
-                t.Start();
-            }
-            else
-            {
-                StartMonitoring();
-            }
-        }
-
-        private void StartMonitoring()
-        {
-            windowThread = new Thread(() =>
-            {
-                powerWindow = new PowerNotificationWindow(
-                    OnDisplayStateChanged,
-                    msg => WriteLog(msg, EventLogEntryType.Error));
-                Application.Run(powerWindow);
-            });
-            windowThread.SetApartmentState(ApartmentState.STA);
-            windowThread.Start();
         }
 
         protected override void OnStop()
         {
-            // 起動遅延中の場合はキャンセル
-            if (_startupCts != null)
-            {
-                _startupCts.Cancel();
-                _startupCts = null;
-            }
-
-            if (powerWindow != null)
-            {
-                try
-                {
-                    powerWindow.Invoke(new Action(() => powerWindow.CloseWindow()));
-                }
-                catch { }
-            }
-            if (windowThread != null)
-            {
-                windowThread.Join(2000);
-            }
-
             ForceEnableMouse("サービス停止");
             SaveState(true);
-        }
-
-        private void OnDisplayStateChanged(int displayState)
-        {
-            if (displayState == 0 || displayState == 2) // Display OFF or Dimmed
-            {
-                DisableMouse("ディスプレイ消灯 (状態=" + displayState + ")");
-            }
-            else if (displayState == 1) // Display ON
-            {
-                EnableMouse("ディスプレイ点灯");
-            }
         }
 
         protected override void OnSessionChange(SessionChangeDescription changeDescription)
@@ -118,7 +53,7 @@ namespace MouseWakeSuppressor
             }
             else if (changeDescription.Reason == SessionChangeReason.SessionLock)
             {
-                DisableMouse("セッションロック");
+                ScheduleAutomaticDisable("セッションロック");
             }
             else if (changeDescription.Reason == SessionChangeReason.SessionLogoff)
             {
@@ -131,10 +66,7 @@ namespace MouseWakeSuppressor
         {
             if (command == 128) // Toggle
             {
-                if (mouseDisabled)
-                    EnableMouse("手動トグル (コマンド128)");
-                else
-                    DisableMouse("手動トグル (コマンド128)");
+                ToggleMouse();
             }
             else if (command == 129) // Enable
             {
@@ -146,13 +78,21 @@ namespace MouseWakeSuppressor
             }
             else if (command == 131) // Reload Config
             {
-                LoadConfig();
+                lock (_stateLock)
+                {
+                    LoadConfig();
+                }
+            }
+            else if (command == 132) // 自動無効化を予約
+            {
+                ScheduleAutomaticDisable("ディスプレイ消灯");
             }
         }
 
         private void LoadConfig()
         {
             devices.Clear();
+            _automaticDisableDelayMilliseconds = DefaultAutomaticDisableDelayMilliseconds;
             try
             {
                 string exeDir = AppDomain.CurrentDomain.BaseDirectory;
@@ -179,6 +119,27 @@ namespace MouseWakeSuppressor
                         }
                     }
                 }
+
+                // 不正値で安全機構が意図せず無効にならないよう、既定値へ戻す。
+                sb.Clear();
+                GetPrivateProfileString(
+                    "Service",
+                    "AutomaticDisableDelayMs",
+                    DefaultAutomaticDisableDelayMilliseconds.ToString(),
+                    sb,
+                    (uint)sb.Capacity,
+                    iniPath);
+                int configuredDelay;
+                if (int.TryParse(sb.ToString().Trim(), out configuredDelay) && configuredDelay >= 0)
+                {
+                    _automaticDisableDelayMilliseconds = configuredDelay;
+                }
+                else
+                {
+                    WriteLog(
+                        "AutomaticDisableDelayMs が不正なため、既定値 5000 ms を使用します。",
+                        EventLogEntryType.Warning);
+                }
             }
             catch (Exception ex)
             {
@@ -186,23 +147,55 @@ namespace MouseWakeSuppressor
             }
         }
 
-        // [Service] StartupDelaySec の値を読む。未設定または 0 以下なら 0 を返す。
-        private int LoadStartupDelay()
+        private void ToggleMouse()
         {
-            try
+            lock (_stateLock)
             {
-                string exeDir = AppDomain.CurrentDomain.BaseDirectory;
-                string iniPath = Path.Combine(exeDir, "mws_config.ini");
-                if (!File.Exists(iniPath)) return 0;
-
-                StringBuilder sb = new StringBuilder(64);
-                GetPrivateProfileString("Service", "StartupDelaySec", "0", sb, (uint)sb.Capacity, iniPath);
-                int result;
-                if (int.TryParse(sb.ToString().Trim(), out result) && result > 0)
-                    return result;
+                if (mouseDisabled)
+                    EnableMouse("手動トグル (コマンド128)");
+                else
+                    DisableMouse("手動トグル (コマンド128)");
             }
-            catch { }
-            return 0;
+        }
+
+        private void ScheduleAutomaticDisable(string reason)
+        {
+            lock (_stateLock)
+            {
+                // 同じ状態の通知が重なっても、最初の通知からの猶予を延長しない。
+                if (mouseDisabled || _automaticDisableTimer != null) return;
+
+                long generation = ++_automaticDisableGeneration;
+                int delayMilliseconds = _automaticDisableDelayMilliseconds;
+                _automaticDisableTimer = new Timer(
+                    state => CompleteAutomaticDisable(generation, reason, delayMilliseconds),
+                    null,
+                    delayMilliseconds,
+                    Timeout.Infinite);
+            }
+        }
+
+        private void CompleteAutomaticDisable(long generation, string reason, int delayMilliseconds)
+        {
+            lock (_stateLock)
+            {
+                // Dispose と callback の競合時も、取消済み世代には状態を変更させない。
+                if (_automaticDisableTimer == null || generation != _automaticDisableGeneration) return;
+
+                _automaticDisableTimer.Dispose();
+                _automaticDisableTimer = null;
+                DisableMouse(string.Format("{0}から {1} ms 経過", reason, delayMilliseconds));
+            }
+        }
+
+        private void CancelAutomaticDisableLocked()
+        {
+            // 世代を進めることで、既に queue 済みの stale callback も無効化する。
+            _automaticDisableGeneration++;
+            if (_automaticDisableTimer == null) return;
+
+            _automaticDisableTimer.Dispose();
+            _automaticDisableTimer = null;
         }
 
         private void RecoverDevicesOnStartup()
@@ -214,6 +207,8 @@ namespace MouseWakeSuppressor
         {
             lock (_stateLock)
             {
+                // 手動無効化後に不要な自動 callback を残さない。
+                CancelAutomaticDisableLocked();
                 if (mouseDisabled) return;
 
                 LoadConfig();
@@ -233,6 +228,7 @@ namespace MouseWakeSuppressor
         {
             lock (_stateLock)
             {
+                CancelAutomaticDisableLocked();
                 if (!mouseDisabled) return;
 
                 LoadConfig();
@@ -250,6 +246,7 @@ namespace MouseWakeSuppressor
         {
             lock (_stateLock)
             {
+                CancelAutomaticDisableLocked();
                 LoadConfig();
                 WriteLog("マウス強制有効化: " + (string.IsNullOrEmpty(reason) ? "不明" : reason));
                 foreach (var id in devices)
@@ -335,86 +332,6 @@ namespace MouseWakeSuppressor
             StringBuilder lpReturnedString,
             uint nSize,
             string lpFileName);
-    }
-
-    public class PowerNotificationWindow : Form
-    {
-        private static Guid GUID_CONSOLE_DISPLAY_STATE = new Guid("6fe69556-704a-47a0-8f24-c2c28d936fda");
-        private const uint DEVICE_NOTIFY_WINDOW_HANDLE = 0x00000000;
-        private const int WM_POWERBROADCAST = 0x218;
-        private const int PBT_POWERSETTINGCHANGE = 0x8013;
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern IntPtr RegisterPowerSettingNotification(
-            IntPtr hRecipient,
-            ref Guid PowerSettingGuid,
-            uint Flags);
-
-        [DllImport("user32.dll", SetLastError = true)]
-        private static extern bool UnregisterPowerSettingNotification(IntPtr handle);
-
-        private IntPtr powerNotifyHandle = IntPtr.Zero;
-        private Action<int> onDisplayStateChanged = null;
-        private Action<string> onError = null;
-
-        public PowerNotificationWindow(Action<int> callback, Action<string> errorCallback = null)
-        {
-            this.onDisplayStateChanged = callback;
-            this.onError = errorCallback;
-            this.FormBorderStyle = FormBorderStyle.None;
-            this.ShowInTaskbar = false;
-            this.WindowState = FormWindowState.Minimized;
-            this.Load += (s, e) => { this.Hide(); };
-        }
-
-        protected override void OnHandleCreated(EventArgs e)
-        {
-            base.OnHandleCreated(e);
-            try
-            {
-                var guid = GUID_CONSOLE_DISPLAY_STATE;
-                powerNotifyHandle = RegisterPowerSettingNotification(
-                    this.Handle,
-                    ref guid,
-                    DEVICE_NOTIFY_WINDOW_HANDLE);
-
-                if (powerNotifyHandle == IntPtr.Zero)
-                {
-                    int error = Marshal.GetLastWin32Error();
-                    if (onError != null)
-                        onError("RegisterPowerSettingNotification failed. Win32 error: " + error);
-                }
-            }
-            catch { }
-        }
-
-        protected override void WndProc(ref Message m)
-        {
-            if (m.Msg == WM_POWERBROADCAST && (int)m.WParam == PBT_POWERSETTINGCHANGE)
-            {
-                try
-                {
-                    // POWERBROADCAST_SETTING: GUID(16B) + DataLength(4B) + Data(4B)
-                    int displayState = Marshal.ReadInt32(m.LParam, 20);
-                    if (onDisplayStateChanged != null)
-                    {
-                        onDisplayStateChanged(displayState);
-                    }
-                }
-                catch { }
-            }
-            base.WndProc(ref m);
-        }
-
-        public void CloseWindow()
-        {
-            if (powerNotifyHandle != IntPtr.Zero)
-            {
-                UnregisterPowerSettingNotification(powerNotifyHandle);
-                powerNotifyHandle = IntPtr.Zero;
-            }
-            this.Close();
-        }
     }
 
     [RunInstaller(true)]
@@ -526,7 +443,6 @@ namespace MouseWakeSuppressor
 
         // OS起動時に Automatic (Delayed Start) として登録する。
         // これにより他の自動起動サービスが落ち着いた後に起動される。
-        // mws_config.ini の [Service] StartupDelaySec と組み合わせてさらに遅延可能。
         private static void SetDelayedAutoStart()
         {
             try
