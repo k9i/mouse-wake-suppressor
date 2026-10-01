@@ -1,532 +1,287 @@
-; MouseWakeSuppressor.ahk
-; ロック画面中やモニター消灯中にマウスデバイスを PnP レベルで完全無効化し、
-; マウス移動によるモニター点灯やスリープ解除を防ぐ AHK v2 スクリプト
-;
-; このスクリプトは、設定 GUI、トレイアイコン、手動トグルのホットキーを管理し、
-; display state を監視し、デバイス状態を管理する Windows システムサービスへ通知します。
-;
-; 必要権限: 一般ユーザー権限で動作 (サービスインストール/開始/停止時のみ UAC 昇格)
-; ホットキー: Win+Shift+M → マウスを手動トグル
-
-#Requires AutoHotkey v2.0-
+; Mouse Wake Suppressor: UI、電源通知、期限付き非同期 IPC。
+#Requires AutoHotkey v2.0
 #SingleInstance Force
+#Include MwsClient.ahk
+#Include MwsView.ahk
 
-; ──────────────────────────────────────────────
-; グローバル変数
-; ──────────────────────────────────────────────
-global g_devices := []         ; [{id: "HID\...", name: "..."}, ...]
-global g_lastState := ""       ; トレイ更新のキャッシュ用
-global g_powerNotifyHandles := [] ; RegisterPowerSettingNotification の戻り値
-global g_sessionDisplayNotificationSeen := false ; セッション表示通知を受信済みか
-global g_consoleDisplayGuid := "{6FE69556-704A-47A0-8F24-C2C28D936FDA}"
-global g_sessionDisplayGuid := "{2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5}"
+global g_config := A_ScriptDir "\mws_config.ini"
+global g_client := MwsClient("MouseWakeSuppressor-v1", Setting("IpcTimeoutMs", 500, 100))
+global g_interval := Setting("PollIntervalMs", 1000, 100)
+global g_fast := Setting("OperationPollIntervalMs", 100, 20)
+global g_boot := "", g_pending := 0, g_commands := [], g_next := 0, g_lastTray := ""
+global g_handles := [], g_sessionSeen := false, g_sequence := 0, g_admin := 0
+global g_console := GuidBuffer("{6FE69556-704A-47A0-8F24-C2C28D936FDA}")
+global g_session := GuidBuffer("{2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5}")
+global g_selection := 0
+global g_initialSelection := IniRead(g_config, "Devices", "InstanceIds", "") = ""
 
-; ──────────────────────────────────────────────
-; 初期化
-; ──────────────────────────────────────────────
-; サービスのインストール確認と自動開始
-if !IsServiceInstalled() {
-    result := MsgBox("Mouse Wake Suppressor サービスがインストールされていません。`nインストールしますか？ (UAC 昇格が必要です)",
-                     "Mouse Wake Suppressor", 0x24)
-    if result = "Yes" {
-        ServiceInstall()
-        Sleep(1500)  ; サービス起動を待機
-        if !IsServiceRunning() {
-            MsgBox "サービスの起動に失敗しました。管理者として実行して再試行してください。",
-                   "Mouse Wake Suppressor", 0x10
-            ExitApp
-        }
-    } else {
-        MsgBox "サービスがインストールされない場合、本スクリプトは動作しません。終了します。",
-               "Mouse Wake Suppressor", 0x10
-        ExitApp
-    }
-} else if !IsServiceRunning() {
-    result := MsgBox("サービスが停止しています。起動しますか？ (UAC 昇格が必要です)",
-                     "Mouse Wake Suppressor", 0x24)
-    if result = "Yes" {
-        ServiceStart()
-        Sleep(1000)
-    }
-}
-
-; 対象デバイスのロード、未設定の場合は GUI 選択
-g_devices := LoadOrDetectDevices(true)
-
-if g_devices.Length = 0 {
-    MsgBox "対象マウスデバイスが選択されませんでした。終了します。",
-           "Mouse Wake Suppressor", 0x10
-    ExitApp
-}
-
-; トレイアイコンとメニューの初期表示
-UpdateTray()
-
-; ──────────────────────────────────────────────
-; ホットキー: Win+Shift+M → 手動トグル
-; ──────────────────────────────────────────────
-#+m:: {
-    ManualToggleMouse()
-}
-
-; ──────────────────────────────────────────────
-; ユーザーセッションの display state を検出し、service に状態遷移を通知する。
-; ──────────────────────────────────────────────
-
-; ユーザーセッションの表示状態を主経路として購読する。
-; GUID_CONSOLE_DISPLAY_STATE も、セッション通知が届かない環境用の
-; フォールバックとして併せて購読する。
-RegisterDisplayPowerNotifications()
-
-OnMessage(0x218, OnPowerBroadcast)    ; WM_POWERBROADCAST
-
-OnExit(CleanupNotifications)
-
-; ──────────────────────────────────────────────
-; サービス制御用ヘルパー
-; ──────────────────────────────────────────────
-IsServiceInstalled() {
-    return RunWait('sc query MouseWakeSuppressor',, "Hide") != 1060 ; ERROR_SERVICE_DOES_NOT_EXIST = 1060
-}
-
-IsServiceRunning() {
-    tmpFile := A_Temp "\mws_sc.txt"
-    try FileDelete(tmpFile)
-    RunWait 'cmd.exe /c sc query MouseWakeSuppressor > "' tmpFile '"',, "Hide"
-    if !FileExist(tmpFile)
-        return false
-    content := FileRead(tmpFile)
-    try FileDelete(tmpFile)
-    return InStr(content, "STATE") && InStr(content, "RUNNING")
-}
-
-ServiceInstall() {
-    serviceExe := A_ScriptDir "\MouseWakeSuppressorService.exe"
-    if !FileExist(serviceExe) {
-        MsgBox "サービス実行ファイルが見つかりません: `n" serviceExe, "Mouse Wake Suppressor", 0x10
-        return
-    }
-    ; -install はサービス登録・DACL設定・起動を内包する。管理者権限で実行。
-    try RunWait '*RunAs "' serviceExe '" -install',, "Hide"
-}
-
-ServiceUninstall() {
-    serviceExe := A_ScriptDir "\MouseWakeSuppressorService.exe"
-    if FileExist(serviceExe) {
-        ; -uninstall はサービス停止・登録解除を内包する。管理者権限で実行。
-        try RunWait '*RunAs "' serviceExe '" -uninstall',, "Hide"
-    }
-}
-
-ServiceStart() {
-    if A_IsAdmin {
-        RunWait 'sc start MouseWakeSuppressor',, "Hide"
-    } else {
-        try RunWait '*RunAs cmd.exe /c "sc start MouseWakeSuppressor"',, "Hide"
-    }
-}
-
-ServiceStop() {
-    if A_IsAdmin {
-        RunWait 'sc stop MouseWakeSuppressor',, "Hide"
-    } else {
-        try RunWait '*RunAs cmd.exe /c "sc stop MouseWakeSuppressor"',, "Hide"
-    }
-}
-
-ServiceControl(code) {
-    ; サービス DACL により一般ユーザーでも実行可能
-    RunWait 'sc control MouseWakeSuppressor ' code,, "Hide"
-}
-
-; ──────────────────────────────────────────────
-; ディスプレイ電源通知の登録
-; ──────────────────────────────────────────────
-RegisterDisplayPowerNotifications() {
-    global g_powerNotifyHandles, g_consoleDisplayGuid, g_sessionDisplayGuid
-
-    sessionHandle := RegisterPowerNotification(g_sessionDisplayGuid)
-    consoleHandle := RegisterPowerNotification(g_consoleDisplayGuid)
-
-    if !sessionHandle && !consoleHandle {
-        MsgBox "ディスプレイ電源状態の通知を登録できませんでした。`n"
-             . "自動消灯時のマウス無効化は動作しない可能性があります。",
-               "Mouse Wake Suppressor", 0x30
-    }
-}
-
-RegisterPowerNotification(guid) {
-    global g_powerNotifyHandles
-
-    guidBuf := GuidToBuffer(guid)
-    handle := DllCall("user32\RegisterPowerSettingNotification",
-        "Ptr", A_ScriptHwnd, "Ptr", guidBuf.Ptr, "UInt", 0, "Ptr")
+ShowTray("Unknown", "接続待ち")
+for guid in [g_session, g_console] {
+    handle := DllCall("user32\RegisterPowerSettingNotification", "Ptr", A_ScriptHwnd, "Ptr", guid, "UInt", 0, "Ptr")
     if handle
-        g_powerNotifyHandles.Push(handle)
-    return handle
+        g_handles.Push(handle)
+}
+OnMessage(0x218, PowerChanged)
+OnExit(Cleanup)
+SetTimer(Pump, 20)
+initialService := ServiceState()
+if initialService = 0
+    AdminAction("install")
+else if initialService = 1
+    AdminAction("start")
+#+m::Request("toggle", true)
+
+; 誤設定で polling が停止しないよう、範囲外は既定値に戻す。
+Setting(key, fallback, minimum) {
+    global g_config
+    value := IniRead(g_config, "UI", key, fallback)
+    return IsInteger(value) && value >= minimum && value <= 600000 ? Integer(value) : fallback
 }
 
-GuidToBuffer(guid) {
-    guid := Trim(guid, "{}")
-    parts := StrSplit(guid, "-")
-    if parts.Length != 5
-        throw ValueError("Invalid GUID: " guid)
-
-    data4 := parts[4] parts[5]
-    if StrLen(data4) != 16
-        throw ValueError("Invalid GUID: " guid)
-
-    guidBuf := Buffer(16, 0)
-    NumPut("UInt", "0x" parts[1], guidBuf, 0)
-    NumPut("UShort", "0x" parts[2], guidBuf, 4)
-    NumPut("UShort", "0x" parts[3], guidBuf, 6)
-    Loop 8
-        NumPut("UChar", "0x" SubStr(data4, (A_Index - 1) * 2 + 1, 2), guidBuf, A_Index + 7)
-    return guidBuf
-}
-
-GuidMatches(ptr, guid) {
-    guidBuf := GuidToBuffer(guid)
-    Loop 16 {
-        offset := A_Index - 1
-        if NumGet(ptr, offset, "UChar") != NumGet(guidBuf, offset, "UChar")
-            return false
-    }
-    return true
-}
-
-GetMouseStateFromService() {
-    stateFile := A_ScriptDir "\mws_state.txt"
-    if !FileExist(stateFile)
-        return "UNKNOWN"
+; SCM API の状態値を使用し、表示言語や sc 出力に依存しない。
+ServiceState() {
+    scm := DllCall("advapi32\OpenSCManagerW", "Ptr", 0, "Ptr", 0, "UInt", 1, "Ptr")
+    if !scm
+        return -1
+    service := 0
     try {
-        content := Trim(FileRead(stateFile))
-        if content == "1"
-            return "ENABLED"
-        if content == "0"
-            return "DISABLED"
+        service := DllCall("advapi32\OpenServiceW", "Ptr", scm, "Str", "MouseWakeSuppressor", "UInt", 4, "Ptr")
+        if !service
+            return A_LastError = 1060 ? 0 : -1
+        status := Buffer(36, 0)
+        if !DllCall("advapi32\QueryServiceStatusEx", "Ptr", service, "Int", 0, "Ptr", status, "UInt", status.Size, "UInt*", &needed := 0)
+            return -1
+        return NumGet(status, 4, "UInt")
+    } finally {
+        if service
+            DllCall("advapi32\CloseServiceHandle", "Ptr", service)
+        DllCall("advapi32\CloseServiceHandle", "Ptr", scm)
     }
-    return "UNKNOWN"
 }
 
-ManualToggleMouse(*) {
-    global g_devices
-
-    previousState := GetMouseStateFromService()
-    ServiceControl(128)
-    timeoutMs := Max(6000, g_devices.Length * 5000 + 1000)
-
-    ; command の受付だけでは device 操作の完了を保証できないため、状態遷移を待つ。
-    if previousState == "ENABLED" {
-        if WaitForMouseState("DISABLED", timeoutMs)
-            TrayTip("マウスを手動で無効化しました。", "Mouse Wake Suppressor", 1)
-    } else if previousState == "DISABLED" {
-        WaitForMouseState("ENABLED", timeoutMs)
-    } else {
-        Sleep(150) ; 既存状態が不明な場合は誤通知を避ける
-    }
-
-    UpdateTray()
-}
-
-WaitForMouseState(expectedState, timeoutMs) {
-    startTime := DllCall("Kernel32\GetTickCount64", "UInt64")
-    while DllCall("Kernel32\GetTickCount64", "UInt64") - startTime < timeoutMs {
-        if GetMouseStateFromService() == expectedState
-            return true
-        Sleep(50)
-    }
-    return false
-}
-
-; ──────────────────────────────────────────────
-; 設定ファイルからロードまたは新規検出
-; ──────────────────────────────────────────────
-LoadOrDetectDevices(showGui := true) {
-    configFile := A_ScriptDir "\mws_config.ini"
-
-    ; 保存済みの設定があれば読み込む
-    savedIds   := IniRead(configFile, "Devices", "InstanceIds", "")
-    savedNames := IniRead(configFile, "Devices", "Names", "")
-    if savedIds != "" {
-        ids   := StrSplit(savedIds, "|")
-        names := StrSplit(savedNames, "|")
-        devices := []
-        for i, id in ids {
-            if Trim(id) = ""
-                continue
-            name := (i <= names.Length) ? names[i] : id
-            devices.Push({id: Trim(id), name: Trim(name)})
-        }
-        if devices.Length > 0
-            return devices
-    }
-
-    if !showGui
-        return []
-
-    ; powershell.exe (Windows PowerShell 5.1) でマウスデバイスを列挙
-    allDevices := EnumMouseDevices()
-
-    if allDevices.Length = 0 {
-        MsgBox "Mouse クラスのデバイスが見つかりませんでした。`n`n"
-             . "マウスが接続されているか確認してください。",
-               "Mouse Wake Suppressor", 0x10
-        return []
-    }
-
-    ; 1台だけなら自動選択、複数なら GUI で選択
-    if allDevices.Length = 1 {
-        SaveDeviceConfig(configFile, allDevices)
-        ServiceControl(131) ; サービスに設定リロードを通知
-        return allDevices
-    }
-    return SelectDevicesGui(allDevices, configFile)
-}
-
-; ──────────────────────────────────────────────
-; powershell.exe でマウスクラスのデバイスを列挙
-; ──────────────────────────────────────────────
-EnumMouseDevices() {
-    devices := []
-    tmpFile := A_Temp "\mws_enum.txt"
-    ps1File := A_Temp "\mws_enum.ps1"
-
-    try FileDelete(ps1File)
-    psScript := "Get-PnpDevice -Class Mouse -PresentOnly"
-              . " | ForEach-Object {"
-              . " $mfr = (Get-PnpDeviceProperty -InstanceId $_.InstanceId"
-              . " -KeyName 'DEVPKEY_Device_Manufacturer' -ErrorAction SilentlyContinue"
-              . " ).Data; if (-not $mfr) { $mfr = $_.Manufacturer }"
-              . " $_.InstanceId + ';;' + $_.FriendlyName + ';;' + $mfr + ';;' + $_.Status"
-              . " } | Set-Content -Path '" tmpFile "' -Encoding UTF8"
-    FileAppend(psScript, ps1File)
-
-    RunWait 'powershell.exe -NoProfile -ExecutionPolicy Bypass -File "' ps1File '"',, "Hide"
-    try FileDelete(ps1File)
-
-    if !FileExist(tmpFile)
-        return devices
-    content := FileRead(tmpFile)
-    try FileDelete(tmpFile)
-
-    for line in StrSplit(content, "`n") {
-        line := Trim(line, "`r `t")
-        if line = ""
-            continue
-        parts := StrSplit(line, ";;")
-        id   := (parts.Length >= 1) ? parts[1] : ""
-        name := (parts.Length >= 2) ? parts[2] : id
-        mfr  := (parts.Length >= 3) ? parts[3] : ""
-        stat := (parts.Length >= 4) ? parts[4] : ""
-        if id != ""
-            devices.Push({id: id, name: name, manufacturer: mfr, status: stat})
-    }
-    return devices
-}
-
-; ──────────────────────────────────────────────
-; GUI でデバイスを選択させる
-; ──────────────────────────────────────────────
-SelectDevicesGui(allDevices, configFile) {
-    gw := Gui("+AlwaysOnTop", "Mouse Wake Suppressor - デバイス選択")
-    gw.SetFont("s10")
-    gw.Add("Text",, "モニターOFF時に無効化するマウスデバイスを選択してください。`n(複数選択可: Ctrl+クリック)")
-
-    displayList := []
-    for d in allDevices {
-        label := d.name
-        if d.manufacturer != ""
-            label .= "  (" d.manufacturer ")"
-        label .= "  [" d.status "]  " d.id
-        displayList.Push(label)
-    }
-    lb := gw.Add("ListBox", "r10 w600 Multi", displayList)
-
-    gw.Add("Text", "y+8", "選択は設定ファイルに保存されます。再選択するには mws_config.ini を削除。")
-    btnOk := gw.Add("Button", "Default w80 y+8", "OK")
-    btnCancel := gw.Add("Button", "xp+90 yp", "キャンセル")
-
-    selected := []
-    cancelled := false
-
-    btnOk.OnEvent("Click", (*) => (selected := lb.Value, gw.Destroy()))
-    btnCancel.OnEvent("Click", (*) => (cancelled := true, gw.Destroy()))
-    gw.OnEvent("Close", (*) => (cancelled := true))
-
-    gw.Show()
-    while WinExist("Mouse Wake Suppressor - デバイス選択")
-        Sleep 100
-
-    if cancelled || selected.Length = 0
-        return []
-
-    devices := []
-    for idx in selected
-        devices.Push(allDevices[idx])
-
-    SaveDeviceConfig(configFile, devices)
-    ServiceControl(131) ; サービスに設定リロードを通知
-    return devices
-}
-
-; ──────────────────────────────────────────────
-; 設定ファイルに保存
-; ──────────────────────────────────────────────
-SaveDeviceConfig(configFile, devices) {
-    ids := ""
-    names := ""
-    for i, d in devices {
-        ids   .= (i > 1 ? "|" : "") d.id
-        names .= (i > 1 ? "|" : "") d.name
-    }
-    IniWrite(ids,   configFile, "Devices", "InstanceIds")
-    IniWrite(names, configFile, "Devices", "Names")
-}
-
-; ──────────────────────────────────────────────
-; トレイアイコンとメニューを更新
-; ──────────────────────────────────────────────
-UpdateTray() {
-    global g_lastState, g_devices
-
-    currentState := GetMouseStateFromService()
-    serviceRunning := IsServiceRunning()
-
-    if !serviceRunning {
-        currentState := "STOPPED"
-    }
-
-    ; 状態キャッシュチェック
-    if (currentState == g_lastState)
+; 管理操作だけを昇格し、SCM API を使用するサービス executable に渡す。
+AdminAction(command, *) {
+    global g_admin
+    if g_admin
         return
-    g_lastState := currentState
-
-    if currentState == "DISABLED" {
-        TraySetIcon "shell32.dll", 131
-        A_IconTip := "Mouse Wake Suppressor`nMouse [DISABLED] (Win+Shift+M to Enable)"
-    } else if currentState == "ENABLED" {
-        TraySetIcon "shell32.dll", 18
-        A_IconTip := "Mouse Wake Suppressor`nMouse [ENABLED] (Win+Shift+M to Disable)"
-    } else {
-        TraySetIcon "shell32.dll", 110
-        A_IconTip := "Mouse Wake Suppressor`nService is NOT running!"
-    }
-    A_TrayMenu.Delete()
-    A_TrayMenu.AddStandard()
+    if MsgBox("サービスの " command " を実行しますか? (管理者権限が必要です)", "Mouse Wake Suppressor", "YesNo Icon?") != "Yes"
+        return
     try {
-      A_TrayMenu.Delete("&Help")
-      A_TrayMenu.Delete("&Window Spy")
-      A_TrayMenu.Delete("&Pause Script")
+        Run('*RunAs "' A_ScriptDir '\MouseWakeSuppressorService.exe" -' command, , "Hide", &pid)
+        g_admin := DllCall("OpenProcess", "UInt", 0x101000, "Int", 0, "UInt", pid, "Ptr")
+        if !g_admin
+            throw OSError()
+    } catch as err {
+        MsgBox("管理操作を開始できませんでした: " err.Message, "Mouse Wake Suppressor", "Iconx")
     }
-    A_TrayMenu.Add() ; セパレータライン
-    if currentState == "DISABLED" {
-        A_TrayMenu.Add("Mouse: DISABLED (-> to Enable)", ManualToggleMouse)
-        A_TrayMenu.Default := "Mouse: DISABLED (-> to Enable)"
-    } else if currentState == "ENABLED" {
-        A_TrayMenu.Add("Mouse: ENABLED (-> to Disable)", ManualToggleMouse)
-        A_TrayMenu.Default := "Mouse: ENABLED (-> to Disable)"
-    } else if currentState == "STOPPED" {
-        A_TrayMenu.Add("サービスが停止しています (開始する)", (*) => (ServiceStart(), Sleep(500), UpdateTray()))
-        A_TrayMenu.Default := "サービスが停止しています (開始する)"
+}
+
+; 要求を重複させず、復旧要求は未送信の自動無効化より先に送る。
+Request(command, manual := false, *) {
+    global g_pending, g_commands, g_next
+    if manual && (g_pending || g_commands.Length) {
+        TrayTip("先の要求の結果を確認中です。", "Mouse Wake Suppressor")
+        return
     }
-    A_TrayMenu.Add()
-
-    ; デバイス一覧
-    g_devices := LoadOrDetectDevices(false)
-    for d in g_devices {
-        label := "  " d.name
-        if d.HasProp("manufacturer") && d.manufacturer != ""
-            label .= " (" d.manufacturer ")"
-        A_TrayMenu.Add(label, (*) => 0)
-        A_TrayMenu.Disable(label)
-    }
-    A_TrayMenu.Add()
-
-    A_TrayMenu.Add("マウス設定をリセット", ResetConfig)
-
-    if serviceRunning {
-        A_TrayMenu.Add("サービスを停止(要管理者権限)", (*) => (ServiceStop(), Sleep(300), UpdateTray()))
-        A_TrayMenu.Add("サービスを再起動(要管理者権限)", (*) => (ServiceStop(), Sleep(500), ServiceStart(), Sleep(300), UpdateTray()))
+    if command = "enable" {
+        retained := []
+        for item in g_commands
+            if item.command != "schedule"
+                retained.Push(item)
+        g_commands := retained
+        g_commands.InsertAt(1, {command: command, manual: manual})
     } else {
-        A_TrayMenu.Add("サービスを開始(要管理者権限)", (*) => (ServiceStart(), Sleep(300), UpdateTray()))
-    }
-    A_TrayMenu.Add("サービスをアンインストール(要管理者権限)", (*) => UninstallServiceMenu())
-    A_TrayMenu.Add()
-    A_TrayMenu.Add("終了 (常駐トレイを閉じる)", (*) => ExitApp())
-}
-
-; ──────────────────────────────────────────────
-; 設定リセット
-; ──────────────────────────────────────────────
-ResetConfig(*) {
-    configFile := A_ScriptDir "\mws_config.ini"
-    if FileExist(configFile)
-        IniDelete(configFile, "Devices") ; service 設定を保持して device 選択だけを消去
-
-    ServiceControl(131) ; サービスの設定リロード
-
-    result := MsgBox("マウス設定をリセットしました。`n新しいマウスを選択しますか？",
-                     "Mouse Wake Suppressor", 0x24)
-    if result = "Yes" {
-        Reload
-    }
-}
-
-; ──────────────────────────────────────────────
-; アンインストールハンドラー
-; ──────────────────────────────────────────────
-UninstallServiceMenu() {
-    result := MsgBox("Mouse Wake Suppressor サービスをアンインストールしますか？`n(常駐トレイも終了します)",
-                     "Mouse Wake Suppressor", 0x24)
-    if result = "Yes" {
-        ServiceUninstall()
-        ExitApp()
-    }
-}
-
-; ──────────────────────────────────────────────
-; 電源ブロードキャストハンドラ (ディスプレイ消灯/点灯)
-; ──────────────────────────────────────────────
-OnPowerBroadcast(wParam, lParam, msg, hwnd) {
-    global g_consoleDisplayGuid, g_sessionDisplayGuid, g_sessionDisplayNotificationSeen
-
-    if wParam = 0x8013 && lParam != 0 { ; PBT_POWERSETTINGCHANGE
-        ; POWERBROADCAST_SETTING 構造体: GUID(16B) + DataLength(4B) + Data
-        dataLength := NumGet(lParam, 16, "UInt")
-        if dataLength < 4
-            return
-
-        if GuidMatches(lParam, g_sessionDisplayGuid) {
-            g_sessionDisplayNotificationSeen := true
-        } else if GuidMatches(lParam, g_consoleDisplayGuid) {
-            ; セッション通知が利用できる場合は、そのセッション固有の状態を優先する。
-            if g_sessionDisplayNotificationSeen
+        for item in g_commands
+            if !manual && item.command = command
                 return
-        } else {
-            return
-        }
+        g_commands.Push({command: command, manual: manual})
+    }
+    g_next := 0
+}
 
-        displayState := NumGet(lParam, 20, "UInt")
-        if displayState = 0 or displayState = 2 { ; OFF or Dimmed
-            ServiceControl(132) ; service に自動無効化を予約
-            Sleep(150)
-            UpdateTray()
-        } else if displayState = 1 {               ; ON
-            ServiceControl(129) ; マウス有効化
-            Sleep(150)
-            UpdateTray()
+; 非同期 IPC と管理プロセスを監視し、UI thread で待機しない。
+Pump() {
+    global g_client, g_boot, g_sequence, g_commands, g_pending, g_next, g_interval, g_fast, g_admin
+    if g_admin && DllCall("WaitForSingleObject", "Ptr", g_admin, "UInt", 0) = 0 {
+        ok := DllCall("GetExitCodeProcess", "Ptr", g_admin, "UInt*", &code := 0)
+        DllCall("CloseHandle", "Ptr", g_admin)
+        g_admin := 0
+        TrayTip(ok && code = 0 ? "管理操作が完了しました。" : "管理操作に失敗しました。exit=" code, "Mouse Wake Suppressor")
+    }
+    if g_client.busy || A_TickCount < g_next
+        return
+    id := DllCall("GetCurrentProcessId") "-" A_TickCount "-" (++g_sequence)
+    command := "status"
+    manual := false
+    if g_commands.Length && g_boot != "" {
+        item := g_commands.RemoveAt(1)
+        command := item.command
+        manual := item.manual
+        if manual
+            g_pending := {id: id, boot: g_boot, command: command}
+    }
+    watch := g_pending ? g_pending.id : ""
+    g_next := A_TickCount + (g_pending ? g_fast : g_interval)
+    g_client.Send("1`t" id "`t" g_boot "`t" command "`t" watch "`n", Receive.Bind(id, command, manual))
+}
+
+; 完了通知は送信した request と同じ boot に限定する。
+Receive(id, command, manual, text, error) {
+    global g_boot, g_pending, g_next, g_fast, g_initialSelection
+    if error != "" {
+        service := ServiceState()
+        label := service = 0 ? "サービス未インストール" : service = 1 ? "サービス停止" : service = 2 || service = 3 ? "サービス移行中" : "通信不能"
+        ShowTray("Unknown", label " / " error)
+        return
+    }
+    try {
+        state := MwsParse(text, id)
+        g_boot := state.boot
+        completion := MwsCompletion(state, g_pending, command)
+        if completion.clear {
+            if completion.success && g_pending.command = "reset"
+                g_initialSelection := true
+            TrayTip(completion.message, "Mouse Wake Suppressor", completion.success ? 1 : 2)
+            g_pending := 0
         }
+        detail := state.stopping ? "停止処理中" : state.active != "" ? "処理中: " state.active : state.scheduled ? "無効化予約中" : ""
+        if state.error != ""
+            detail .= " / " state.error
+        ShowTray(state.state, detail, state.devices)
+        if command = "enumerate" && state.accepted = "Read"
+            SelectDevices(state.devices)
+        if g_initialSelection && state.active = "" && state.error = "" && state.accepted = "Read" {
+            g_initialSelection := false
+            Request("enumerate")
+        }
+        if g_pending
+            g_next := A_TickCount + g_fast
+    } catch as err {
+        ShowTray("Unknown", "protocol エラー: " err.Message)
     }
 }
 
-; ──────────────────────────────────────────────
-; 終了時のクリーンアップ
-; ──────────────────────────────────────────────
-CleanupNotifications(exitReason, exitCode) {
-    global g_powerNotifyHandles
-    for handle in g_powerNotifyHandles {
-        if handle
-            DllCall("user32\UnregisterPowerSettingNotification", "Ptr", handle)
+; 表示内容が変わった場合だけトレイを再構築する。
+ShowTray(state, detail, devices := []) {
+    global g_lastTray
+    view := MwsPresentation(state, detail)
+    label := view.label
+    key := state "|" detail
+    for d in devices
+        key .= "|" d.id d.state d.recovery d.result
+    if key = g_lastTray
+        return
+    g_lastTray := key
+    TraySetIcon("shell32.dll", view.icon)
+    A_IconTip := view.tip
+    A_TrayMenu.Delete()
+    A_TrayMenu.Add(label " (Win+Shift+M)", (*) => Request("toggle", true))
+    A_TrayMenu.Default := label " (Win+Shift+M)"
+    if detail != "" {
+        A_TrayMenu.Add(SubStr(detail, 1, 180), (*) => 0)
+        A_TrayMenu.Disable(SubStr(detail, 1, 180))
     }
+    A_TrayMenu.Add("復旧を再試行", (*) => Request("enable", true))
+    A_TrayMenu.Add()
+    for index, d in devices {
+        item := index ": " d.id " [" d.state "]" (d.recovery ? " 復旧対象" : "")
+        A_TrayMenu.Add(item, ShowDevice.Bind(d))
+    }
+    A_TrayMenu.Add("対象マウスを選択", (*) => Request("enumerate"))
+    A_TrayMenu.Add("設定をリロード", (*) => Request("reload", true))
+    A_TrayMenu.Add("復旧して設定をリセット", (*) => Request("reset", true))
+    A_TrayMenu.Add()
+    for action in ["install", "start", "stop", "restart", "uninstall"]
+        A_TrayMenu.Add("サービス: " action, AdminAction.Bind(action))
+    A_TrayMenu.Add("終了", (*) => ExitApp())
+}
+
+; 詳細は必要なときだけ表示し、トレイの短い状態表示と分ける。
+ShowDevice(device, *) {
+    MsgBox(device.id "`n状態: " device.state "`n復旧対象: " (device.recovery ? "はい" : "いいえ") "`n`n" device.result, "Mouse Wake Suppressor - 操作詳細")
+}
+
+; GUI は callback で完了し、固定 Sleep による待機をしない。
+SelectDevices(devices) {
+    global g_selection, g_config
+    if g_selection
+        return
+    if devices.Length = 0 {
+        MsgBox("Mouse クラスのデバイスが見つかりません。", "Mouse Wake Suppressor")
+        return
+    }
+    window := Gui(, "Mouse Wake Suppressor - 対象選択")
+    g_selection := window
+    window.AddText(, "消灯時に無効化するマウスを選択してください。")
+    list := window.AddListView("w820 r12 Checked", ["名前", "メーカー", "状態", "Instance ID"])
+    selected := "|" IniRead(g_config, "Devices", "InstanceIds", "") "|"
+    for d in devices
+        list.Add(InStr(selected, "|" d.id "|") ? "Check" : "", d.name, d.manufacturer, d.state, d.id)
+    list.ModifyCol()
+    window.AddButton("Default", "保存").OnEvent("Click", SaveSelection.Bind(window, list, devices))
+    window.OnEvent("Close", CloseSelection.Bind(window))
+    window.Show()
+}
+
+; 同じ値は INI に書き戻さず、復旧対象はサービスに保持させる。
+SaveSelection(window, list, devices, *) {
+    global g_config
+    ids := "", names := "", row := 0
+    while row := list.GetNext(row, "Checked") {
+        ids .= (ids = "" ? "" : "|") devices[row].id
+        names .= (names = "" ? "" : "|") devices[row].name
+    }
+    try {
+        if IniRead(g_config, "Devices", "InstanceIds", "") != ids
+            IniWrite(ids, g_config, "Devices", "InstanceIds")
+        if IniRead(g_config, "Devices", "Names", "") != names
+            IniWrite(names, g_config, "Devices", "Names")
+        CloseSelection(window)
+        Request("reload", true)
+    } catch as err {
+        MsgBox("設定保存に失敗しました: " err.Message, "Mouse Wake Suppressor", "Iconx")
+    }
+}
+
+; 閉じた GUI の参照を残さず再選択を許可する。
+CloseSelection(window, *) {
+    global g_selection
+    window.Destroy()
+    g_selection := 0
+}
+
+; OS の GUID parser を使用して endian の取り違えを防ぐ。
+GuidBuffer(text) {
+    data := Buffer(16, 0)
+    if DllCall("ole32\CLSIDFromString", "Str", text, "Ptr", data, "Int") != 0
+        throw ValueError("GUID が不正です。")
+    return data
+}
+
+; session 固有の表示通知を優先し、ON では予約取消と復旧を要求する。
+PowerChanged(wParam, lParam, *) {
+    global g_session, g_console, g_sessionSeen
+    if wParam != 0x8013 || !lParam || NumGet(lParam, 16, "UInt") < 4
+        return
+    if DllCall("ntdll\RtlCompareMemory", "Ptr", lParam, "Ptr", g_session, "UPtr", 16, "UPtr") = 16 {
+        g_sessionSeen := true
+    } else if DllCall("ntdll\RtlCompareMemory", "Ptr", lParam, "Ptr", g_console, "UPtr", 16, "UPtr") != 16 || g_sessionSeen {
+        return
+    }
+    value := NumGet(lParam, 20, "UInt")
+    if value = 1
+        Request("enable")
+    else if value = 0 || value = 2
+        Request("schedule")
+}
+
+; 終了時の OS 資源を解放する。保留 I/O の buffer は process 終了まで保持する。
+Cleanup(*) {
+    global g_handles, g_client, g_admin
+    for handle in g_handles
+        DllCall("user32\UnregisterPowerSettingNotification", "Ptr", handle)
+    if g_client.handle
+        DllCall("CancelIoEx", "Ptr", g_client.handle, "Ptr", 0)
+    if g_admin
+        DllCall("CloseHandle", "Ptr", g_admin)
 }

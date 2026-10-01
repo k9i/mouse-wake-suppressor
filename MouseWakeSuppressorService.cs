@@ -1,507 +1,127 @@
 using System;
-using System.Collections.Generic;
-using System.ServiceProcess;
-using System.Runtime.InteropServices;
-using System.Diagnostics;
-using System.IO;
-using System.Text;
 using System.ComponentModel;
 using System.Configuration.Install;
+using System.Diagnostics;
 using System.Reflection;
-using System.Threading;
+using System.ServiceProcess;
 
 namespace MouseWakeSuppressor
 {
-    public class MouseWakeSuppressorService : ServiceBase
+    /// <summary>Windows の通知を直列 worker に中継するサービスです。</summary>
+    public sealed class MouseWakeSuppressorService : ServiceBase
     {
-        private List<string> devices = new List<string>();
-        private volatile bool mouseDisabled = false;
-        private readonly object _stateLock = new object();
-        private bool _eventSourceCreated = false;
-        private const int DefaultAutomaticDisableDelayMilliseconds = 5000;
-        private int _automaticDisableDelayMilliseconds = DefaultAutomaticDisableDelayMilliseconds;
-        private Timer _automaticDisableTimer = null;
-        private long _automaticDisableGeneration = 0;
-
-        /// <summary>サービスの基本属性を初期化します。</summary>
+        private Engine engine;
+        private PipeServer pipe;
+        /// <summary>SCM から受け取る通知を設定します。</summary>
         public MouseWakeSuppressorService()
         {
-            this.ServiceName = "MouseWakeSuppressor";
-            this.CanHandleSessionChangeEvent = true;
+            ServiceName = "MouseWakeSuppressor";
+            CanHandleSessionChangeEvent = true;
+            CanShutdown = true;
+            AutoLog = false;
         }
-
         protected override void OnStart(string[] args)
         {
-            InitEventSource();
-            LoadConfig();
-            // 起動直後にマウスを有効に戻し状態ファイルを更新
-            RecoverDevicesOnStartup();
-            SaveState(true);
+            engine = new Engine(new WindowsDevices(), new RecoveryFile(), new IniConfig(AppDomain.CurrentDomain.BaseDirectory), new Scheduler(), Log);
+            engine.Start();
+            try { pipe = new PipeServer(engine); }
+            catch { engine.Stop(); throw; }
         }
-
         protected override void OnStop()
+        { StopEngine(true); }
+        private void StopEngine(bool notifyScm)
         {
-            ForceEnableMouse("サービス停止");
-            SaveState(true);
+            if (engine == null) return;
+            engine.BeginStop();
+            if (pipe != null) pipe.Dispose();
+            // 復旧中に SCM へ停止完了を返さない。
+            while (!engine.Join(1000)) if (notifyScm) RequestAdditionalTime(10000);
+            engine.Dispose();
+            engine = null;
         }
-
-        protected override void OnSessionChange(SessionChangeDescription changeDescription)
+        protected override void OnShutdown() { StopEngine(false); }
+        protected override void OnSessionChange(SessionChangeDescription change)
         {
-            if (changeDescription.Reason == SessionChangeReason.SessionUnlock)
-            {
-                EnableMouse("セッションアンロック");
-            }
-            else if (changeDescription.Reason == SessionChangeReason.SessionLock)
-            {
-                ScheduleAutomaticDisable("セッションロック");
-            }
-            else if (changeDescription.Reason == SessionChangeReason.SessionLogoff)
-            {
-                ForceEnableMouse("セッションログオフ");
-                SaveState(true);
-            }
+            if (change.Reason == SessionChangeReason.SessionLock) engine.Schedule();
+            else if (change.Reason == SessionChangeReason.SessionUnlock || change.Reason == SessionChangeReason.SessionLogoff)
+                engine.Submit("enable", Guid.NewGuid().ToString("N"));
         }
-
         protected override void OnCustomCommand(int command)
         {
-            if (command == 128) // Toggle
-            {
-                ToggleMouse();
-            }
-            else if (command == 129) // Enable
-            {
-                EnableMouse("手動有効化 (コマンド129)");
-            }
-            else if (command == 130) // Disable
-            {
-                DisableMouse("手動無効化 (コマンド130)");
-            }
-            else if (command == 131) // Reload Config
-            {
-                lock (_stateLock)
-                {
-                    LoadConfig();
-                }
-            }
-            else if (command == 132) // 自動無効化を予約
-            {
-                ScheduleAutomaticDisable("ディスプレイ消灯");
-            }
+            string[] commands = { "toggle", "enable", "disable", "reload", "schedule" };
+            if (command >= 128 && command <= 132) engine.Submit(commands[command - 128], Guid.NewGuid().ToString("N"));
         }
-
-        private void LoadConfig()
+        private static void Log(string message, LogLevel level)
         {
-            devices.Clear();
-            _automaticDisableDelayMilliseconds = DefaultAutomaticDisableDelayMilliseconds;
-            try
-            {
-                string exeDir = AppDomain.CurrentDomain.BaseDirectory;
-                string iniPath = Path.Combine(exeDir, "mws_config.ini");
-
-                if (!File.Exists(iniPath))
-                {
-                    return;
-                }
-
-                StringBuilder sb = new StringBuilder(16384);
-                GetPrivateProfileString("Devices", "InstanceIds", "", sb, (uint)sb.Capacity, iniPath);
-                string savedIds = sb.ToString();
-
-                if (!string.IsNullOrEmpty(savedIds))
-                {
-                    string[] ids = savedIds.Split('|');
-                    foreach (var id in ids)
-                    {
-                        string trimmed = id.Trim();
-                        if (!string.IsNullOrEmpty(trimmed))
-                        {
-                            devices.Add(trimmed);
-                        }
-                    }
-                }
-
-                // 不正値で安全機構が意図せず無効にならないよう、既定値へ戻す。
-                sb.Clear();
-                GetPrivateProfileString(
-                    "Service",
-                    "AutomaticDisableDelayMs",
-                    DefaultAutomaticDisableDelayMilliseconds.ToString(),
-                    sb,
-                    (uint)sb.Capacity,
-                    iniPath);
-                int configuredDelay;
-                if (int.TryParse(sb.ToString().Trim(), out configuredDelay) && configuredDelay >= 0)
-                {
-                    _automaticDisableDelayMilliseconds = configuredDelay;
-                }
-                else
-                {
-                    WriteLog(
-                        "AutomaticDisableDelayMs が不正なため、既定値 5000 ms を使用します。",
-                        EventLogEntryType.Warning);
-                }
-            }
-            catch (Exception ex)
-            {
-                WriteLog("Error loading configuration: " + ex.Message, EventLogEntryType.Error);
-            }
+            try { EventLog.WriteEntry("MouseWakeSuppressor", message, level == LogLevel.Information ? EventLogEntryType.Information : level == LogLevel.Error ? EventLogEntryType.Error : EventLogEntryType.Warning); }
+            catch (Exception ex) { Trace.WriteLine("EventLog: " + ex.Message); }
         }
-
-        private void ToggleMouse()
-        {
-            lock (_stateLock)
-            {
-                if (mouseDisabled)
-                    EnableMouse("手動トグル (コマンド128)");
-                else
-                    DisableMouse("手動トグル (コマンド128)");
-            }
-        }
-
-        private void ScheduleAutomaticDisable(string reason)
-        {
-            lock (_stateLock)
-            {
-                // 同じ状態の通知が重なっても、最初の通知からの猶予を延長しない。
-                if (mouseDisabled || _automaticDisableTimer != null) return;
-
-                long generation = ++_automaticDisableGeneration;
-                int delayMilliseconds = _automaticDisableDelayMilliseconds;
-                _automaticDisableTimer = new Timer(
-                    state => CompleteAutomaticDisable(generation, reason, delayMilliseconds),
-                    null,
-                    delayMilliseconds,
-                    Timeout.Infinite);
-            }
-        }
-
-        private void CompleteAutomaticDisable(long generation, string reason, int delayMilliseconds)
-        {
-            lock (_stateLock)
-            {
-                // Dispose と callback の競合時も、取消済み世代には状態を変更させない。
-                if (_automaticDisableTimer == null || generation != _automaticDisableGeneration) return;
-
-                _automaticDisableTimer.Dispose();
-                _automaticDisableTimer = null;
-                DisableMouse(string.Format("{0}から {1} ms 経過", reason, delayMilliseconds));
-            }
-        }
-
-        private void CancelAutomaticDisableLocked()
-        {
-            // 世代を進めることで、既に queue 済みの stale callback も無効化する。
-            _automaticDisableGeneration++;
-            if (_automaticDisableTimer == null) return;
-
-            _automaticDisableTimer.Dispose();
-            _automaticDisableTimer = null;
-        }
-
-        private void RecoverDevicesOnStartup()
-        {
-            ForceEnableMouse("サービス起動時の復旧");
-        }
-
-        private void DisableMouse(string reason = "")
-        {
-            lock (_stateLock)
-            {
-                // 手動無効化後に不要な自動 callback を残さない。
-                CancelAutomaticDisableLocked();
-                if (mouseDisabled) return;
-
-                LoadConfig();
-                if (devices.Count == 0) return;
-
-                WriteLog("マウス無効化: " + (string.IsNullOrEmpty(reason) ? "不明" : reason));
-                foreach (var id in devices)
-                {
-                    RunPnpUtil("/disable-device \"" + id + "\"");
-                }
-                mouseDisabled = true;
-                SaveState(false);
-            }
-        }
-
-        private void EnableMouse(string reason = "")
-        {
-            lock (_stateLock)
-            {
-                CancelAutomaticDisableLocked();
-                if (!mouseDisabled) return;
-
-                LoadConfig();
-                WriteLog("マウス有効化: " + (string.IsNullOrEmpty(reason) ? "不明" : reason));
-                foreach (var id in devices)
-                {
-                    RunPnpUtil("/enable-device \"" + id + "\"");
-                }
-                mouseDisabled = false;
-                SaveState(true);
-            }
-        }
-
-        private void ForceEnableMouse(string reason = "")
-        {
-            lock (_stateLock)
-            {
-                CancelAutomaticDisableLocked();
-                LoadConfig();
-                WriteLog("マウス強制有効化: " + (string.IsNullOrEmpty(reason) ? "不明" : reason));
-                foreach (var id in devices)
-                {
-                    RunPnpUtil("/enable-device \"" + id + "\"");
-                }
-                mouseDisabled = false;
-            }
-        }
-
-        private void RunPnpUtil(string argument)
-        {
-            try
-            {
-                ProcessStartInfo psi = new ProcessStartInfo();
-                psi.FileName = "pnputil.exe";
-                psi.Arguments = argument;
-                psi.CreateNoWindow = true;
-                psi.UseShellExecute = false;
-                psi.WindowStyle = ProcessWindowStyle.Hidden;
-
-                using (Process p = Process.Start(psi))
-                {
-                    p.WaitForExit(5000);
-                    if (p.ExitCode != 0)
-                    {
-                        if (p.ExitCode == 50 && argument.StartsWith("/enable-device")) // exit code 50 は already enabled
-                        {
-                            WriteLog(string.Format("pnputil {0} exited with code 50 (already enabled).", argument), EventLogEntryType.Information);
-                        }
-                        else
-                        {
-                            WriteLog(string.Format("pnputil {0} exited with code {1}.", argument, p.ExitCode), EventLogEntryType.Warning);
-                        }
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                WriteLog("pnputil execution error: " + ex.Message, EventLogEntryType.Error);
-            }
-        }
-
-        private void SaveState(bool enabled)
-        {
-            try
-            {
-                string exeDir = AppDomain.CurrentDomain.BaseDirectory;
-                string stateFile = Path.Combine(exeDir, "mws_state.txt");
-                File.WriteAllText(stateFile, enabled ? "1" : "0");
-            }
-            catch { }
-        }
-
-        private void InitEventSource()
-        {
-            try
-            {
-                if (!EventLog.SourceExists("MouseWakeSuppressor"))
-                {
-                    EventLog.CreateEventSource("MouseWakeSuppressor", "Application");
-                }
-                _eventSourceCreated = true;
-            }
-            catch { }
-        }
-
-        private void WriteLog(string message, EventLogEntryType type = EventLogEntryType.Information)
-        {
-            if (!_eventSourceCreated) return;
-            try
-            {
-                EventLog.WriteEntry("MouseWakeSuppressor", message, type);
-            }
-            catch { }
-        }
-
-        [DllImport("kernel32.dll", CharSet = CharSet.Unicode)]
-        private static extern uint GetPrivateProfileString(
-            string lpAppName,
-            string lpKeyName,
-            string lpDefault,
-            StringBuilder lpReturnedString,
-            uint nSize,
-            string lpFileName);
     }
-
+    /// <summary>LocalSystem のサービスを登録します。</summary>
     [RunInstaller(true)]
-    public class ProjectInstaller : Installer
+    public sealed class ProjectInstaller : Installer
     {
-        private ServiceProcessInstaller processInstaller;
-        private ServiceInstaller serviceInstaller;
-
+        /// <summary>サービスのアカウントと起動設定を定義します。</summary>
         public ProjectInstaller()
         {
-            processInstaller = new ServiceProcessInstaller();
-            serviceInstaller = new ServiceInstaller();
-
-            processInstaller.Account = ServiceAccount.LocalSystem;
-            processInstaller.Username = null;
-            processInstaller.Password = null;
-
-            serviceInstaller.StartType = ServiceStartMode.Automatic;
-            serviceInstaller.ServiceName = "MouseWakeSuppressor";
-            serviceInstaller.DisplayName = "Mouse Wake Suppressor Service";
-            serviceInstaller.Description = "モニター消灯時に、指定したマウスを一時的に無効化して不意のスリープ解除を防ぎます。";
-
-            Installers.Add(processInstaller);
-            Installers.Add(serviceInstaller);
+            Installers.Add(new ServiceProcessInstaller { Account = ServiceAccount.LocalSystem });
+            Installers.Add(new ServiceInstaller {
+                ServiceName = "MouseWakeSuppressor", DisplayName = "Mouse Wake Suppressor Service",
+                Description = "消灯時のマウス無効化と永続記録に基づく復旧を行います。",
+                StartType = ServiceStartMode.Automatic, DelayedAutoStart = true
+            });
         }
     }
-
-    static class Program
+    internal static class Program
     {
-        static void Main(string[] args)
+        private static int Main(string[] args)
         {
-            if (args.Length > 0)
+            // 対話 CLI と SCM 起動を区別する。
+            if (args.Length == 0 && !Environment.UserInteractive) { ServiceBase.Run(new MouseWakeSuppressorService()); return 0; }
+            if (args.Length != 1 || args[0] == "--help")
             {
-                string cmd = args[0].ToLower();
-                if (cmd == "-install" || cmd == "/i")
-                {
-                    try
-                    {
-                        ManagedInstallerClass.InstallHelper(new string[] { Assembly.GetExecutingAssembly().Location });
-                        Console.WriteLine("Service installed successfully.");
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine("Installation error: " + ex.Message);
-                        return;
-                    }
-                    // 一般ユーザーが sc control でカスタムコマンドを送れるよう DACL を設定
-                    SetServiceDacl();
-                    // OS起動時の遅延自動起動を有効化 (Automatic Delayed Start)
-                    SetDelayedAutoStart();
-                    // サービスを起動
-                    StartService();
-                    return;
-                }
-                else if (cmd == "-uninstall" || cmd == "/u")
-                {
-                    // アンインストール前にサービスを停止
-                    StopService();
-                    try
-                    {
-                        ManagedInstallerClass.InstallHelper(new string[] { "/u", Assembly.GetExecutingAssembly().Location });
-                        Console.WriteLine("Service uninstalled successfully.");
-                    }
-                    catch (Exception ex)
-                    {
-                        Console.WriteLine("Uninstallation error: " + ex.Message);
-                    }
-                    return;
-                }
+                Console.WriteLine("マウスの復旧を管理する Windows サービスです。\n使い方: MouseWakeSuppressorService.exe -install|-uninstall|-start|-stop|-restart\n管理者権限が必要です。引数なしではこのヘルプを表示します。");
+                return args.Length == 1 ? 0 : 64;
             }
-
-            ServiceBase.Run(new MouseWakeSuppressorService());
-        }
-
-        // 一般ユーザー (Users グループ) がサービスの状態照会とカスタムコマンドを
-        // 送信できるよう DACL を設定する。管理者でのインストール時に一度だけ実行。
-        private static void SetServiceDacl()
-        {
             try
             {
-                // BU (Builtin Users) に CC+LC+SW+LO+CR+RC を付与:
-                //   CC = SERVICE_QUERY_CONFIG
-                //   LC = SERVICE_QUERY_STATUS
-                //   SW = SERVICE_ENUMERATE_DEPENDENTS
-                //   LO = SERVICE_INTERROGATE
-                //   CR = SERVICE_USER_DEFINED_CONTROL  ← sc control に必要
-                //   RC = READ_CONTROL
-                const string dacl =
-                    "D:(A;;CCLCSWRPWPDTLOCRRC;;;SY)" +
-                    "(A;;CCDCLCSWRPWPDTLOCRSDRCWDWO;;;BA)" +
-                    "(A;;CCLCSWLOCRRC;;;IU)" +
-                    "(A;;CCLCSWLOCRRC;;;SU)" +
-                    "(A;;CCLCSWLOCRRC;;;BU)";
-
-                ProcessStartInfo psi = new ProcessStartInfo("sc",
-                    "sdset MouseWakeSuppressor " + dacl);
-                psi.CreateNoWindow = true;
-                psi.UseShellExecute = false;
-                using (Process p = Process.Start(psi))
+                string command = args[0].ToLowerInvariant();
+                if (command == "-install" || command == "/i")
                 {
-                    p.WaitForExit(5000);
+                    ManagedInstallerClass.InstallHelper(new[] { Assembly.GetExecutingAssembly().Location });
+                    ServiceSecurity.Configure(); Start();
                 }
+                else if (command == "-uninstall" || command == "/u")
+                {
+                    Stop();
+                    // 復旧未完了のまま次回の復旧手段を削除しない。
+                    if (new RecoveryFile().Load().Count != 0) throw new InvalidOperationException("復旧対象が残っています。再接続後にサービスを開始し、復旧を再試行してください。");
+                    ManagedInstallerClass.InstallHelper(new[] { "/u", Assembly.GetExecutingAssembly().Location });
+                }
+                else if (command == "-start") Start();
+                else if (command == "-stop") Stop();
+                else if (command == "-restart") { Stop(); Start(); }
+                else { Console.Error.WriteLine("不明な引数です。--help を参照してください。"); return 64; }
+                Console.WriteLine("操作が完了しました。"); return 0;
             }
-            catch (Exception ex)
+            catch (UnauthorizedAccessException ex) { Console.Error.WriteLine(ex.Message); return 77; }
+            catch (Exception ex) { Console.Error.WriteLine("操作に失敗しました: " + ex.Message); return 74; }
+        }
+        private static void Start()
+        {
+            using (var sc = new ServiceController("MouseWakeSuppressor"))
             {
-                Console.WriteLine("DACL setting error: " + ex.Message);
+                if (sc.Status == ServiceControllerStatus.Stopped) sc.Start();
+                sc.WaitForStatus(ServiceControllerStatus.Running, TimeSpan.FromSeconds(30));
             }
         }
-
-        // OS起動時に Automatic (Delayed Start) として登録する。
-        // これにより他の自動起動サービスが落ち着いた後に起動される。
-        private static void SetDelayedAutoStart()
+        private static void Stop()
         {
-            try
+            using (var sc = new ServiceController("MouseWakeSuppressor"))
             {
-                ProcessStartInfo psi = new ProcessStartInfo("sc",
-                    "config MouseWakeSuppressor start= delayed-auto");
-                psi.CreateNoWindow = true;
-                psi.UseShellExecute = false;
-                using (Process p = Process.Start(psi))
-                {
-                    p.WaitForExit(5000);
-                }
+                if (sc.Status != ServiceControllerStatus.Stopped && sc.Status != ServiceControllerStatus.StopPending) sc.Stop();
+                sc.WaitForStatus(ServiceControllerStatus.Stopped, TimeSpan.FromMinutes(10));
             }
-            catch (Exception ex)
-            {
-                Console.WriteLine("Delayed auto start config error: " + ex.Message);
-            }
-        }
-
-        private static void StartService()
-        {
-            try
-            {
-                using (System.ServiceProcess.ServiceController sc =
-                    new System.ServiceProcess.ServiceController("MouseWakeSuppressor"))
-                {
-                    if (sc.Status != System.ServiceProcess.ServiceControllerStatus.Running)
-                    {
-                        sc.Start();
-                        sc.WaitForStatus(
-                            System.ServiceProcess.ServiceControllerStatus.Running,
-                            TimeSpan.FromSeconds(10));
-                        Console.WriteLine("Service started.");
-                    }
-                }
-            }
-            catch (Exception ex)
-            {
-                Console.WriteLine("Service start error: " + ex.Message);
-            }
-        }
-
-        private static void StopService()
-        {
-            try
-            {
-                using (System.ServiceProcess.ServiceController sc =
-                    new System.ServiceProcess.ServiceController("MouseWakeSuppressor"))
-                {
-                    if (sc.Status == System.ServiceProcess.ServiceControllerStatus.Running)
-                    {
-                        sc.Stop();
-                        sc.WaitForStatus(
-                            System.ServiceProcess.ServiceControllerStatus.Stopped,
-                            TimeSpan.FromSeconds(10));
-                    }
-                }
-            }
-            catch { }
         }
     }
 }

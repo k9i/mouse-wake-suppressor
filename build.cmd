@@ -1,17 +1,26 @@
 @echo off
+chcp 65001 >nul
 setlocal EnableDelayedExpansion
-set DIR=%~dp0
-set CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
-if not exist "%CSC%" (
-    echo ERROR: .NET Framework 4 compiler not found: %CSC%
-    echo Please install .NET Framework 4.x and retry.
-    exit /b 1
+if "%~1"=="--build" goto build
+echo Mouse Wake Suppressor のサービスを build します。
+echo 使い方: build.cmd --build
+echo compiler は環境変数 MWS_CSC で変更できます。
+if "%~1"=="--help" exit /b 0
+exit /b 64
+:build
+if not "%~2"=="" exit /b 64
+if not defined MWS_CSC set "MWS_CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+if not exist "%MWS_CSC%" (
+    echo .NET Framework compiler が見つかりません。 1>&2
+    exit /b 69
 )
-"%CSC%" /target:exe /out:"%DIR%MouseWakeSuppressorService.exe" /reference:System.ServiceProcess.dll,System.dll,System.Configuration.Install.dll "%DIR%MouseWakeSuppressorService.cs"
-set BUILD_EXIT=!ERRORLEVEL!
-if !BUILD_EXIT! neq 0 (
-    echo BUILD FAILED - exit code !BUILD_EXIT!
-    exit /b !BUILD_EXIT!
+pushd "%~dp0" || exit /b 74
+"%MWS_CSC%" /nologo /target:exe /out:MouseWakeSuppressorService.exe /reference:System.ServiceProcess.dll,System.dll,System.Core.dll,System.Configuration.Install.dll MouseWakeSuppressorService.cs Core.cs WindowsPlatform.cs Ipc.cs > __build.log 2>&1
+if not "!errorlevel!"=="0" (
+    type __build.log 1>&2
+    popd
+    exit /b 65
 )
-echo BUILD SUCCEEDED: %DIR%MouseWakeSuppressorService.exe
-endlocal
+popd
+echo build が完了しました。
+exit /b 0
