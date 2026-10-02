@@ -7,28 +7,29 @@
 global g_config := A_ScriptDir "\mws_config.ini"
 global g_client := MwsClient("MouseWakeSuppressor-v1", Setting("IpcTimeoutMs", 500, 100))
 global g_interval := Setting("PollIntervalMs", 1000, 100)
+global g_batteryInterval := Setting("BatteryPollIntervalMs", 5000, 100)
 global g_fast := Setting("OperationPollIntervalMs", 100, 20)
 global g_boot := "", g_pending := 0, g_commands := [], g_next := 0, g_lastTray := ""
-global g_handles := [], g_sessionSeen := false, g_sequence := 0, g_admin := 0
+global g_handles := [], g_sessionSeen := false, g_sequence := 0, g_admin := 0, g_pumpDue := 0
 global g_console := GuidBuffer("{6FE69556-704A-47A0-8F24-C2C28D936FDA}")
 global g_session := GuidBuffer("{2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5}")
+global g_powerSource := GuidBuffer("{5D3E9A59-E9D5-4B00-A6BD-FF34FF516548}")
+global g_onBattery := OnBatteryPower()
 global g_selection := 0
 global g_initialSelection := IniRead(g_config, "Devices", "InstanceIds", "") = ""
 
 ShowTray("Unknown", "接続待ち")
-for guid in [g_session, g_console] {
+OnMessage(0x218, PowerChanged)
+for guid in [g_session, g_console, g_powerSource] {
     handle := DllCall("user32\RegisterPowerSettingNotification", "Ptr", A_ScriptHwnd, "Ptr", guid, "UInt", 0, "Ptr")
     if handle
         g_handles.Push(handle)
 }
-OnMessage(0x218, PowerChanged)
 OnExit(Cleanup)
-SetTimer(Pump, 20)
-initialService := ServiceState()
-if initialService = 0
-    AdminAction("install")
-else if initialService = 1
-    AdminAction("start")
+SchedulePump()
+startupAction := MwsStartupAction(ServiceState())
+if startupAction != ""
+    AdminAction(startupAction)
 #+m::Request("toggle", true)
 
 ; 誤設定で polling が停止しないよう、範囲外は既定値に戻す。
@@ -36,6 +37,12 @@ Setting(key, fallback, minimum) {
     global g_config
     value := IniRead(g_config, "UI", key, fallback)
     return IsInteger(value) && value >= minimum && value <= 600000 ? Integer(value) : fallback
+}
+
+; API 失敗や不明値では省電力側へ倒し、不要な wake-up を増やさない。
+OnBatteryPower() {
+    status := Buffer(12, 0)
+    return !DllCall("kernel32\GetSystemPowerStatus", "Ptr", status, "Int") || MwsAcLineOnBattery(NumGet(status, 0, "UChar"))
 }
 
 ; SCM API の状態値を使用し、表示言語や sc 出力に依存しない。
@@ -71,6 +78,7 @@ AdminAction(command, *) {
         g_admin := DllCall("OpenProcess", "UInt", 0x101000, "Int", 0, "UInt", pid, "Ptr")
         if !g_admin
             throw OSError()
+        SchedulePump(250)
     } catch as err {
         MsgBox("管理操作を開始できませんでした: " err.Message, "Mouse Wake Suppressor", "Iconx")
     }
@@ -97,19 +105,60 @@ Request(command, manual := false, *) {
         g_commands.Push({command: command, manual: manual})
     }
     g_next := 0
+    SchedulePump()
 }
 
-; 非同期 IPC と管理プロセスを監視し、UI thread で待機しない。
-Pump() {
-    global g_client, g_boot, g_sequence, g_commands, g_pending, g_next, g_interval, g_fast, g_admin
-    if g_admin && DllCall("WaitForSingleObject", "Ptr", g_admin, "UInt", 0) = 0 {
-        ok := DllCall("GetExitCodeProcess", "Ptr", g_admin, "UInt*", &code := 0)
-        DllCall("CloseHandle", "Ptr", g_admin)
-        g_admin := 0
-        TrayTip(ok && code = 0 ? "管理操作が完了しました。" : "管理操作に失敗しました。exit=" code, "Mouse Wake Suppressor")
-    }
-    if g_client.busy || A_TickCount < g_next
+; 最も早い期限だけを one-shot timer に登録し、idle 中の定期 wake-up を避ける。
+SchedulePump(delay := 0) {
+    global g_pumpDue
+    now := DllCall("GetTickCount64", "UInt64")
+    requestedDue := now + Max(1, Integer(delay))
+    due := MwsEarlierDue(g_pumpDue, requestedDue)
+    if due != requestedDue
         return
+    g_pumpDue := due
+    SetTimer(Pump, -Max(1, due - now))
+}
+
+; IPC、polling、管理 process のうち最も近い期限で再開する。
+ScheduleNextPump() {
+    global g_next, g_admin
+    now := DllCall("GetTickCount64", "UInt64")
+    delay := g_next > now ? g_next - now : 0
+    if g_admin
+        delay := Min(delay, 250)
+    SchedulePump(delay)
+}
+
+; 非同期 IPC と管理 process を監視し、UI thread で待機しない。
+Pump() {
+    global g_client, g_boot, g_sequence, g_commands, g_pending, g_next, g_interval, g_batteryInterval, g_fast
+    global g_admin, g_pumpDue, g_onBattery
+    g_pumpDue := 0
+    if g_admin {
+        wait := DllCall("WaitForSingleObject", "Ptr", g_admin, "UInt", 0)
+        if wait = 0 {
+            ok := DllCall("GetExitCodeProcess", "Ptr", g_admin, "UInt*", &code := 0)
+            DllCall("CloseHandle", "Ptr", g_admin)
+            g_admin := 0
+            g_next := 0
+            TrayTip(ok && code = 0 ? "管理操作が完了しました。" : "管理操作に失敗しました。exit=" code, "Mouse Wake Suppressor")
+        } else if wait != 0x102 {
+            DllCall("CloseHandle", "Ptr", g_admin)
+            g_admin := 0
+            TrayTip("管理操作の監視に失敗しました。", "Mouse Wake Suppressor", 2)
+        }
+    }
+    if g_client.busy {
+        ; timeout callback 後も CancelIoEx の完了回収まで client が busy のため再確認する。
+        SchedulePump(50)
+        return
+    }
+    now := DllCall("GetTickCount64", "UInt64")
+    if now < g_next {
+        ScheduleNextPump()
+        return
+    }
     id := DllCall("GetCurrentProcessId") "-" A_TickCount "-" (++g_sequence)
     command := "status"
     manual := false
@@ -121,17 +170,20 @@ Pump() {
             g_pending := {id: id, boot: g_boot, command: command}
     }
     watch := g_pending ? g_pending.id : ""
-    g_next := A_TickCount + (g_pending ? g_fast : g_interval)
+    g_next := now + MwsPollInterval(g_onBattery, g_pending, g_interval, g_batteryInterval, g_fast)
     g_client.Send("1`t" id "`t" g_boot "`t" command "`t" watch "`n", Receive.Bind(id, command, manual))
+    if g_admin
+        SchedulePump(250)
 }
 
 ; 完了通知は送信した request と同じ boot に限定する。
 Receive(id, command, manual, text, error) {
-    global g_boot, g_pending, g_next, g_fast, g_initialSelection
+    global g_boot, g_pending, g_next, g_fast, g_initialSelection, g_commands
     if error != "" {
         service := ServiceState()
         label := service = 0 ? "サービス未インストール" : service = 1 ? "サービス停止" : service = 2 || service = 3 ? "サービス移行中" : "通信不能"
         ShowTray("Unknown", label " / " error)
+        ScheduleNextPump()
         return
     }
     try {
@@ -154,10 +206,14 @@ Receive(id, command, manual, text, error) {
             g_initialSelection := false
             Request("enumerate")
         }
+        if g_commands.Length && g_boot != ""
+            g_next := 0
         if g_pending
-            g_next := A_TickCount + g_fast
+            g_next := DllCall("GetTickCount64", "UInt64") + g_fast
+        ScheduleNextPump()
     } catch as err {
         ShowTray("Unknown", "protocol エラー: " err.Message)
+        ScheduleNextPump()
     }
 }
 
@@ -260,9 +316,19 @@ GuidBuffer(text) {
 
 ; session 固有の表示通知を優先し、ON では予約取消と復旧を要求する。
 PowerChanged(wParam, lParam, *) {
-    global g_session, g_console, g_sessionSeen
+    global g_session, g_console, g_powerSource, g_sessionSeen, g_onBattery, g_next
     if wParam != 0x8013 || !lParam || NumGet(lParam, 16, "UInt") < 4
         return
+    if DllCall("ntdll\RtlCompareMemory", "Ptr", lParam, "Ptr", g_powerSource, "UPtr", 16, "UPtr") = 16 {
+        ; short-term power も battery として扱い、AC 以外では wake-up を抑える。
+        onBattery := MwsPowerSourceOnBattery(NumGet(lParam, 20, "UInt"))
+        if onBattery != g_onBattery {
+            g_onBattery := onBattery
+            g_next := 0
+            SchedulePump()
+        }
+        return
+    }
     if DllCall("ntdll\RtlCompareMemory", "Ptr", lParam, "Ptr", g_session, "UPtr", 16, "UPtr") = 16 {
         g_sessionSeen := true
     } else if DllCall("ntdll\RtlCompareMemory", "Ptr", lParam, "Ptr", g_console, "UPtr", 16, "UPtr") != 16 || g_sessionSeen {

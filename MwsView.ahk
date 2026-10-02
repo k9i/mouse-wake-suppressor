@@ -6,6 +6,31 @@ MwsPresentation(state, detail) {
         tip: SubStr("Mouse Wake Suppressor`n" label " " detail, 1, 127)}
 }
 
+; Automatic (Delayed Start) より UI が先に起動しても開始確認を出さない。
+MwsStartupAction(serviceState) {
+    return serviceState = 0 ? "install" : ""
+}
+
+; 操作結果の確認速度を維持しつつ、battery 使用時の idle wake-up を減らす。
+MwsPollInterval(onBattery, pending, regularInterval, batteryInterval, fastInterval) {
+    return pending ? fastInterval : onBattery ? batteryInterval : regularInterval
+}
+
+; GetSystemPowerStatus の不明値は省電力側へ倒す。
+MwsAcLineOnBattery(acLineStatus) {
+    return acLineStatus != 1
+}
+
+; power setting の battery と short-term power を同じ省電力方針にする。
+MwsPowerSourceOnBattery(powerSource) {
+    return powerSource != 0
+}
+
+; 後から来た遅い予約で、既に必要な早い wake-up を延期しない。
+MwsEarlierDue(currentDue, requestedDue) {
+    return !currentDue || requestedDue < currentDue ? requestedDue : currentDue
+}
+
 ; 受付と結果を分離し、再起動や失われた要求を成功通知に変換しない。
 MwsCompletion(state, pending, command) {
     if !pending

@@ -23,6 +23,11 @@ if not "!errorlevel!"=="0" (
     exit /b 1
 )
 if defined MWS_AHK (
+    "%MWS_AHK%" /ErrorStdOut=UTF-8 /Validate setup.ahk
+    if not "!errorlevel!"=="0" (
+        popd
+        exit /b 1
+    )
     "%MWS_AHK%" /ErrorStdOut=UTF-8 /Validate MouseWakeSuppressor.ahk
     if not "!errorlevel!"=="0" (
         popd

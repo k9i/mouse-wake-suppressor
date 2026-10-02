@@ -3,6 +3,7 @@
 #NoTrayIcon
 #Include MwsClient.ahk
 #Include MwsView.ahk
+#Include setup.ahk
 
 if A_Args.Length != 1 || A_Args[1] != "--test" {
     FileAppend("実デバイスを変更せず AHK と模擬 IPC を検証します。`n使い方: AutoHotkey64.exe Tests.ahk --test`n先に test.cmd --test で __tests.exe を作成してください。`n", "*", "UTF-8")
@@ -14,6 +15,18 @@ global endpoint := "MwsAhkTest-" DllCall("GetCurrentProcessId") "-" A_TickCount
 global client := MwsClient(endpoint, 500), sequence := 0, beats := 0
 SetTimer(Heartbeat, 10)
 try {
+    parsed := MwsSetupParseArgs(["install"])
+    Check(parsed.command = "install" && !parsed.elevated && parsed.error = "", "setup 引数解析")
+    g_mwsSetupConsole := false, g_mwsSetupOutput := "", g_mwsSetupError := false
+    MwsSetupWrite("usage`n")
+    Check(g_mwsSetupOutput = "usage`n" && !g_mwsSetupError, "setup console 未接続時の出力")
+    Check(MwsSetupParseArgs([]).error != "" && MwsSetupParseArgs(["bad"]).error != "", "setup 不正引数")
+    Check(MwsSetupMode("C:\repo\setup.ahk", "C:\Users\u\.local\mws\setup.ahk") = "repository", "repository mode")
+    Check(MwsSetupMode("C:\USERS\u\.local\mws\setup.ahk", "C:\Users\u\.local\mws\setup.ahk") = "installed", "installed mode")
+    Check(MwsSetupOutputIsStale("20260101000000", ["20260102000000"]), "build 要否")
+    Check(!MwsSetupOutputIsStale("20260102000000", ["20260101000000"]), "build 済み")
+    Check(MwsSetupStateName(4) = "Running" && MwsSetupStateName(1) = "Stopped", "service state 表示")
+    Check(MwsSetupPathsMatch('"C:\Users\u\.local\mws\MouseWakeSuppressorService.exe" -x', "c:\users\u\.local\mws\MouseWakeSuppressorService.exe"), "登録 path 比較")
     Run('"' A_ScriptDir '\__tests.exe" --mock ' endpoint, , "Hide", &mockPid)
     start := A_TickCount
     loop {
@@ -26,6 +39,14 @@ try {
     }
     initial := reply.state
     Check(initial.state = "Enabled", "起動状態")
+    Check(MwsStartupAction(0) = "install", "未インストール時の導入確認")
+    Check(MwsStartupAction(1) = "", "Delayed Start 待機中は開始確認を出さない")
+    Check(MwsPollInterval(false, false, 1000, 5000, 100) = 1000, "AC idle polling")
+    Check(MwsPollInterval(true, false, 1000, 5000, 100) = 5000, "battery idle polling")
+    Check(MwsPollInterval(true, true, 1000, 5000, 100) = 100, "操作中 polling")
+    Check(!MwsAcLineOnBattery(1) && MwsAcLineOnBattery(0) && MwsAcLineOnBattery(255), "起動時の電源判定")
+    Check(!MwsPowerSourceOnBattery(0) && MwsPowerSourceOnBattery(1) && MwsPowerSourceOnBattery(2), "電源変更通知の判定")
+    Check(MwsEarlierDue(1000, 1500) = 1000 && MwsEarlierDue(1000, 500) = 500, "早い timer 予約を維持")
     enum := Exchange("enumerate", initial.boot)
     Check(enum.state.devices.Length = 2 && InStr(enum.state.devices[1].name, "マウス"), "SetupAPI 代替列挙と UTF-8")
     disabled := Exchange("disable", initial.boot)
@@ -56,7 +77,7 @@ try {
     client := MwsClient(endpoint "-drop", 500)
     dropped := Exchange("status")
     Check(dropped.error != "", "途中切断を成功扱いしない")
-    FileAppend("PASS AHK: 非同期 IPC、期限、切断、部分状態、通知、version、再起動`n", "*", "UTF-8")
+    FileAppend("PASS AHK: 非同期 IPC、期限、切断、部分状態、通知、version、再起動、Delayed Start、電源連動 polling`n", "*", "UTF-8")
     ExitApp(0)
 } catch as err {
     FileAppend("FAIL AHK: " err.Message " / " err.Stack "`n", "**", "UTF-8")

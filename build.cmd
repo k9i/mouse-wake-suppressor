@@ -1,17 +1,16 @@
 @echo off
-chcp 65001 >nul
 setlocal EnableDelayedExpansion
 if "%~1"=="--build" goto build
-echo Mouse Wake Suppressor のサービスを build します。
-echo 使い方: build.cmd --build
-echo compiler は環境変数 MWS_CSC で変更できます。
+echo Builds the Mouse Wake Suppressor service.
+echo Usage: build.cmd --build
+echo Set the compiler path with the MWS_CSC environment variable.
 if "%~1"=="--help" exit /b 0
 exit /b 64
 :build
 if not "%~2"=="" exit /b 64
 if not defined MWS_CSC set "MWS_CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
 if not exist "%MWS_CSC%" (
-    echo .NET Framework compiler が見つかりません。 1>&2
+    echo The .NET Framework compiler was not found. 1>&2
     exit /b 69
 )
 pushd "%~dp0" || exit /b 74
@@ -22,5 +21,5 @@ if not "!errorlevel!"=="0" (
     exit /b 65
 )
 popd
-echo build が完了しました。
+echo Build completed.
 exit /b 0

@@ -31,17 +31,28 @@ test.cmd --test
 
 ## 導入と更新
 
-同じフォルダに次の 5 ファイルを配置します。
+`setup.ahk` を使います。必要な管理操作では UAC dialog が表示されるため、管理者の terminal は不要です。repository からの `install` は、バイナリがない場合、または `build.cmd` や C# build input より古い場合に自動で compile します。配置先は `%USERPROFILE%\.local\mws` です。
+
+```bat
+setup.ahk install
+setup.ahk status
+setup.ahk uninstall
+```
+
+`install` は既存設定を上書きせず、service の停止、file 更新、再登録、開始を行います。失敗時は旧 file と旧登録先の rollback を試みます。配置済みの `setup.ahk` は source がないため rebuild せず、既存 binary による再登録と開始だけを行います。`status` は昇格せず、service 状態、登録先、必要 file、build 要否を表示します。`uninstall` は service 登録だけを解除し、配置先の全 file、`mws_config.ini`、`%ProgramData%\MouseWakeSuppressor` の復旧記録を保持します。`shell:startup` は管理しないため、UI は必要に応じて手動で起動してください。
+
+配置先には次の file を配置します。
 
 - `MouseWakeSuppressorService.exe`
 - `MouseWakeSuppressor.ahk`
 - `MwsClient.ahk`
 - `MwsView.ahk`
+- `setup.ahk`
 - `mws_config.ini` (既存設定がある場合)
 
-AHK を起動すると、未インストールの場合はインストール、停止中の場合は開始の確認が表示されます。未設定の場合は接続後にマウス選択画面が開きます。選択内容は INI に保存します。通常の UI 起動に管理者権限は不要です。
+AHK を起動すると、未インストールの場合だけインストール確認が表示されます。停止中は `Automatic (Delayed Start)` と競合しないよう dialog を出さず、状態を tray に表示します。必要な場合は tray menu から手動で開始できます。未設定の場合は接続後にマウス選択画面が開きます。選択内容は INI に保存します。通常の UI 起動に管理者権限は不要です。
 
-更新時は、旧サービスを停止してマウスが復旧したことを確認してから executable と AHK 関連ファイルを入れ替え、サービスと AHK を起動してください。既存の INI を保持します。既存サービスの登録先と更新先が異なる場合は、登録先の確認と再登録が必要です。
+更新時も repository 側の `setup.ahk install` を実行します。service の登録先が異なる場合は旧登録を解除し、期待する配置先で再登録します。更新済み UI を反映するには、必要に応じて AHK を再起動してください。
 
 管理者の terminal からも管理できます。
 
@@ -111,13 +122,16 @@ InformationLog=0
 
 [UI]
 PollIntervalMs=1000
+BatteryPollIntervalMs=5000
 OperationPollIntervalMs=100
 IpcTimeoutMs=500
 ```
 
 `AutomaticDisableDelayMs` は `0..600000`、`OperationTimeoutMs` は `100..600000` の整数です。不正なサービス設定はエラーとして通知し、その設定での無効化を行いません。設定のリロードはトレイから要求できます。無効化前にも再読込します。進行中の操作の timeout は変更しません。
 
-UI の各値は AHK 起動時に読みます。最小値は通常 polling が `100`、操作待ち polling が `20`、IPC 期限が `100` ms、最大値はすべて `600000` ms です。範囲外は既定値を使用します。サーバー側も各接続に 500 ms の期限を設け、応答しないクライアントを回収します。
+UI の各値は AHK 起動時に読みます。`PollIntervalMs` は AC 接続時、`BatteryPollIntervalMs` は battery または short-term power 使用時の idle polling 間隔です。既定値はそれぞれ `1000`、`5000` ms です。最小値は idle polling が `100`、操作待ち polling が `20`、IPC 期限が `100` ms、最大値はすべて `600000` ms です。範囲外は既定値を使用します。操作要求と power event は idle polling を待たず処理します。サーバー側も各接続に 500 ms の期限を設け、応答しないクライアントを回収します。
+
+AHK の `Pump()` は one-shot timer で必要な時刻にだけ起動します。管理操作中は 250 ms ごと、IPC cancel の回収中は 50 ms ごとに一時的に確認し、idle 中に固定周期の 20 ms timer は使用しません。
 
 `InformationLog=1` のときだけ通常操作の Information ログを出します。Warning / Error は有効で、同じメッセージの再出力を 5 分間抑制します。状態取得はログもファイルも書きません。INI も値が変わった場合だけ保存します。
 
@@ -139,7 +153,7 @@ response は `version / request ID / boot ID / 受付結果 / 集約状態 / 実
 
 実機での消灯・点灯・ロック・アンロック・ログオフ・サービス停止・OS 再起動、製品用 ACL の権限別接続、トレイと通知の実際の見た目は別途確認が必要です。インストール変更や実デバイス操作はユーザーの確認を得て実施してください。OS やドライバ自身の Registry・ログ書き込みは、アプリの書き込みとは分けて測定します。
 
-AHK の自動起動は `shell:startup` に `MouseWakeSuppressor.ahk` のショートカットを配置します。サービスは Automatic (Delayed Start) で登録します。
+サービスは Automatic (Delayed Start) で登録します。
 
 ## ライセンス
 
