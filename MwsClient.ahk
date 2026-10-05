@@ -143,7 +143,9 @@ MwsDecode(text) {
 ; request ID、version、boot ID を対応付けてから UI に渡す。
 MwsParse(text, requestId) {
     p := StrSplit(text, "`t")
-    if p.Length != 13 || p[1] != "1" || p[2] != requestId || p[3] = ""
+    if p[1] != "2"
+        throw ValueError("IPC version が一致しません。service と UI を同時に更新してください。")
+    if p.Length != 14 || p[2] != requestId || p[3] = ""
         throw ValueError("IPC protocol または request ID が一致しません。")
     devices := []
     if p[13] != "" {
@@ -154,5 +156,5 @@ MwsParse(text, requestId) {
             devices.Push({id: MwsDecode(d[1]), name: MwsDecode(d[2]), manufacturer: MwsDecode(d[3]), state: d[4], recovery: d[5] = "1", result: MwsDecode(d[6])})
         }
     }
-    return {request: requestId, boot: p[3], accepted: p[4], state: p[5], active: p[6], scheduled: p[7] = "1", stopping: p[8] = "1", error: MwsDecode(p[9]), operation: p[10], result: p[11], message: MwsDecode(p[12]), devices: devices}
+    return {request: requestId, boot: p[3], accepted: p[4], state: p[5], active: p[6], scheduled: p[7] = "1", stopping: p[8] = "1", error: MwsDecode(p[9]), operation: p[10], result: p[11], message: MwsDecode(p[12]), devices: devices, lockDisplay: MwsDecode(p[14])}
 }

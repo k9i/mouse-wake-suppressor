@@ -44,6 +44,13 @@ namespace MouseWakeSuppressor
                 Run("復旧記録の atomic 更新と破損検出", FileJournal);
                 Run("子プロセスの開始失敗と timeout 回収", Processes);
                 Run("named pipe の切断と再接続", Pipes);
+                Run("ロック消灯の境界と入力の分類", LockTiming);
+                Run("再点灯の猶予と OFF 未確認の再試行", LockRetry);
+                Run("取消、監視復旧、再接続と再起動", LockRecovery);
+                Run("LockDisplay 設定の検証", LockConfiguration);
+                Run("Raw Input と SetupAPI のキーボード ID 対応", KeyboardInterfaces);
+                Run("入力診断の IPC 受付と旧 boot 拒否", LockProtocol);
+                Run("desktop 間の keyboard handle 再照合と期限保持", DesktopKeyboardMap);
                 Console.WriteLine("PASS: " + count + " tests"); return 0;
             }
             catch (Exception ex) { Console.Error.WriteLine("FAIL: " + ex); return 1; }
@@ -51,6 +58,130 @@ namespace MouseWakeSuppressor
         [System.Runtime.InteropServices.DllImport("kernel32.dll")] private static extern uint SetErrorMode(uint mode);
         private static void Run(string name, Action test) { test(); count++; Console.WriteLine("PASS " + name); }
         private static void Check(bool condition, string message) { if (!condition) throw new Exception(message); }
+        private static LockDeadline Deadline()
+        {
+            var value = new LockDeadline(new LockSettings()); value.Reset(0, true); return value;
+        }
+        private static void DesktopKeyboardMap()
+        {
+            var map = new LockKeyboardMap(); var value = Deadline();
+            map.Replace(new Dictionary<IntPtr, string> { { new IntPtr(1), "HID\\K" } }, false);
+            value.Input(1000, true);
+            bool reset = map.Replace(new Dictionary<IntPtr, string> { { new IntPtr(2), "hid\\k" } }, true);
+            if (reset) value.Reset(10000, true);
+            Check(!reset && value.Activity == 1000 && value.Ticket(31000) >= 0, "正常な desktop 切替で入力時刻と期限を維持");
+            Check(!map.Contains(new IntPtr(1)) && map.Contains(new IntPtr(2)), "新 desktop の最初の入力を照合できる");
+            Check(!map.Replace(new Dictionary<IntPtr, string> { { new IntPtr(2), "HID\\K" } }, false), "対象外デバイスの変更では延長しない");
+            Check(map.Replace(new Dictionary<IntPtr, string> { { new IntPtr(3), "HID\\K" } }, false), "同じ desktop での再接続は検出");
+            Check(map.Replace(new Dictionary<IntPtr, string> { { new IntPtr(3), "HID\\OTHER" } }, false), "handle 再利用は検出");
+            Check(map.Replace(new Dictionary<IntPtr, string>(), true), "desktop 切替中の対象脱落は検出");
+        }
+        private static void LockTiming()
+        {
+            var value = Deadline();
+            Check(value.Ticket(29999) < 0 && value.Ticket(30000) >= 0, "30 秒境界");
+            value.Input(29999, false);
+            Check(value.Ticket(30000) >= 0, "マウス、remote、未登録の入力は延長しない");
+            long old = value.Ticket(30000);
+            value.Input(30000, true);
+            Check(!value.Commit(old, 30000), "確認中のキーボード入力で古い要求を取り消す");
+            Check(value.Ticket(59999) < 0 && value.Ticket(60000) >= 0, "登録キーボードだけが 30 秒延長する");
+            value.Reset(0, true); value.Display(20000, 0); value.Input(25000, true); value.Display(25001, 1);
+            Check(value.Ticket(54999) < 0 && value.Ticket(55000) >= 0, "キー操作による復帰の期限");
+        }
+        private static void LockRetry()
+        {
+            var value = Deadline();
+            Check(value.Commit(value.Ticket(30000), 30000), "初回要求");
+            Check(value.State.Contains("通知待ち") && value.Unconfirmed == 1, "送信だけでは成功にしない");
+            Check(value.Ticket(30999) < 0 && value.Ticket(31000) >= 0, "未確認時の最短再試行間隔");
+            value.Commit(value.Ticket(31000), 31000);
+            Check(value.Unconfirmed == 2, "未確認回数");
+            value.Display(31001, 0);
+            Check(value.Unconfirmed == 0 && value.Ticket(99999) < 0, "OFF 確認後は再送しない");
+            value.Display(40000, 1);
+            Check(value.Ticket(40999) < 0 && value.Ticket(41000) >= 0, "再点灯後の猶予");
+            value.Display(40200, 1);
+            Check(value.Ticket(41000) >= 0, "重複 ON で猶予を延長しない");
+            value.Input(40999, true);
+            Check(value.Ticket(41000) < 0 && value.Ticket(70999) >= 0, "猶予中の入力で再消灯取消");
+        }
+        private static void LockRecovery()
+        {
+            var value = Deadline(); long stale = value.Ticket(30000);
+            value.Reset(30000, false);
+            Check(!value.Commit(stale, 30000) && value.Ticket(99999) < 0, "アンロック、session 変更、監視失敗で取消");
+            value.Reset(100000, true);
+            Check(!value.Commit(stale, 130000), "旧世代を再利用しない");
+            Check(value.Ticket(129999) < 0 && value.Ticket(130000) >= 0, "復旧と再接続後は新たな 30 秒");
+            var restarted = Deadline(); restarted.Reset(200000, true);
+            Check(restarted.Ticket(229999) < 0 && restarted.Ticket(230000) >= 0, "service 再起動後も新たな 30 秒");
+            restarted.Display(230001, 0); restarted.Reset(240000, false); restarted.Reset(250000, true);
+            Check(restarted.Ticket(280000) < 0, "入力監視の再接続で確認済み OFF を失わない");
+            restarted.Display(280001, 1);
+            Check(restarted.Ticket(281000) < 0 && restarted.Ticket(281001) >= 0, "監視復旧後の再点灯も猶予を設ける");
+        }
+        private static void LockConfiguration()
+        {
+            string directory = Path.Combine(Path.GetTempPath(), "__mws_lock_" + Guid.NewGuid().ToString("N"));
+            Directory.CreateDirectory(directory);
+            var config = new IniConfig(directory);
+            var value = config.LoadLock();
+            Check(!value.Enabled && value.IdleSeconds == 30 && value.RetryMs == 1000 && value.Keyboards.Count == 0, "既定は無効");
+            string path = Path.Combine(directory, "mws_config.ini");
+            foreach (string body in new[] { "Enabled=1", "Enabled=yes", "IdleTimeoutSeconds=0", "IdleTimeoutSeconds=601", "RetryIntervalMs=999", "KeyboardInstanceIds=invalid" })
+            {
+                File.WriteAllText(path, "[LockDisplay]\n" + body + "\n");
+                bool failed = false; try { config.LoadLock(); } catch (InvalidDataException) { failed = true; }
+                Check(failed, "不正設定の拒否: " + body);
+            }
+            File.WriteAllText(path, "[LockDisplay]\nEnabled=1\nIdleTimeoutSeconds=45\nRetryIntervalMs=2000\nKeyboardInstanceIds=HID\\A|hid\\a\n");
+            value = config.LoadLock();
+            Check(value.Enabled && value.IdleSeconds == 45 && value.RetryMs == 2000 && value.Keyboards.Count == 1, "設定と重複排除");
+        }
+        private static void KeyboardInterfaces()
+        {
+            // 読み取りだけで native layout と interface -> instance ID の経路を検証する。
+            var available = new WindowsDevices(true).Enumerate();
+            uint count = 0, size = (uint)System.Runtime.InteropServices.Marshal.SizeOf(typeof(LockNative.RawDevice));
+            Check(LockNative.GetRawInputDeviceList(null, ref count, size) != uint.MaxValue, "Raw Input 一覧サイズ");
+            var raw = new LockNative.RawDevice[count];
+            uint found = LockNative.GetRawInputDeviceList(raw, ref count, size);
+            Check(found != uint.MaxValue, "Raw Input 一覧");
+            int mapped = 0;
+            for (int i = 0; i < found; i++)
+            {
+                if (raw[i].Type != 1) continue;
+                var name = new StringBuilder(4096); uint capacity = (uint)name.Capacity;
+                Check(LockNative.GetRawInputDeviceInfo(raw[i].Handle, 0x20000007, name, ref capacity) != uint.MaxValue, "Raw Input device name");
+                if (!name.ToString().StartsWith(@"\\?\", StringComparison.Ordinal)) continue;
+                string id = LockNative.InstanceId(name.ToString());
+                Check(available.Any(d => String.Equals(d.Id, id, StringComparison.OrdinalIgnoreCase)), "Keyboard クラスとの一致");
+                mapped++;
+            }
+            Console.WriteLine("INFO: Raw Input keyboard interfaces=" + mapped + " (ロック中の入力受信は未検証)");
+            int session = LockNative.ConsoleSession;
+            if (session >= 0) LockNative.Locked(session);
+        }
+        private static void LockProtocol()
+        {
+            using (var f = new Fixture())
+            {
+                f.Start(); int probes = 0;
+                f.Engine.LockProbe = () => { probes++; return "Accepted"; };
+                f.Engine.LockStatus = () => "監視停止: テスト";
+                f.Engine.Keyboards = () => new List<Device> { new Device { Id = "HID\\K", Name = "Keyboard", Manufacturer = "", State = DeviceState.Enabled } };
+                string boot = f.Engine.Read("").Boot;
+                string[] response = Protocol.Reply(f.Engine, "2\tprobe\told\tlock-probe\t\n").TrimEnd('\n').Split('\t');
+                Check(response.Length == 14 && response[3] == "Restarted" && probes == 0, "旧 boot では診断しない");
+                response = Protocol.Reply(f.Engine, "2\tprobe\t" + boot + "\tlock-probe\t\n").TrimEnd('\n').Split('\t');
+                Check(response[3] == "Accepted" && probes == 1 && Encoding.UTF8.GetString(Convert.FromBase64String(response[13])).Contains("監視停止"), "診断受付と状態 encode");
+                response = Protocol.Reply(f.Engine, "2\tkeys\t\tkeyboards\t\n").TrimEnd('\n').Split('\t');
+                Check(response[3] == "Read" && response[12].Contains(Protocol.Encode("HID\\K")), "キーボード選択一覧");
+                f.Engine.Keyboards = () => { throw new IOException("列挙失敗"); };
+                Check(Protocol.Reply(f.Engine, "2\tkeys\t\tkeyboards\t\n").Contains("Rejected"), "列挙失敗の明示");
+            }
+        }
         private static void Until(Func<bool> condition)
         {
             var watch = Stopwatch.StartNew();
@@ -141,7 +272,7 @@ namespace MouseWakeSuppressor
                 f.Start(); Check(f.Do("disable").Result == "Success", "無効化");
                 Check(f.Engine.Read("").State == "Disabled", "無効状態");
                 int writes = f.Journal.Writes;
-                for (int i = 0; i < 1000; i++) Protocol.Reply(f.Engine, "1\tpoll\t\tstatus\t\n");
+                for (int i = 0; i < 1000; i++) Protocol.Reply(f.Engine, "2\tpoll\t\tstatus\t\n");
                 Check(f.Journal.Writes == writes, "照会で書き込み");
                 Check(f.Do("enable").Result == "Success", "復旧");
                 Check(f.Journal.Writes == 2 && f.Journal.Data.Count == 0, "一往復の記録更新は 2 回");
@@ -329,9 +460,9 @@ namespace MouseWakeSuppressor
             using (var f = new Fixture())
             {
                 f.Start(); string boot = f.Engine.Read("").Boot;
-                Check(Protocol.Reply(f.Engine, "2\tx\t\tstatus\t\n").Contains("VersionMismatch"), "version");
-                Check(Protocol.Reply(f.Engine, "1\tx\told\tdisable\t\n").Contains("Restarted"), "boot");
-                Check(Protocol.Reply(f.Engine, "1\tx\t" + boot + "\tshell\t\n").Contains("Rejected"), "任意コマンド");
+                Check(Protocol.Reply(f.Engine, "1\tx\t\tstatus\t\n").Contains("VersionMismatch"), "version");
+                Check(Protocol.Reply(f.Engine, "2\tx\told\tdisable\t\n").Contains("Restarted"), "boot");
+                Check(Protocol.Reply(f.Engine, "2\tx\t" + boot + "\tshell\t\n").Contains("Rejected"), "任意コマンド");
                 f.Engine.Submit("disable", "once"); Until(() => f.Engine.Read("once").Operation.Result != "Pending");
                 int calls = f.Hardware.Calls.Count; f.Engine.Submit("disable", "once");
                 Check(f.Hardware.Calls.Count == calls, "重複実行");
@@ -374,9 +505,9 @@ namespace MouseWakeSuppressor
                 f.Start(); string name = "MwsTest-" + Guid.NewGuid().ToString("N");
                 using (var server = TestServer(f.Engine, name))
                 {
-                    Check(Exchange(name, "1\tx\t\tstatus\t\n").StartsWith("1\tx\t"), "pipe 応答");
+                    Check(Exchange(name, "2\tx\t\tstatus\t\n").StartsWith("2\tx\t"), "pipe 応答");
                     using (var stalled = new NamedPipeClientStream(".", name, PipeDirection.InOut)) { stalled.Connect(1000); Thread.Sleep(650); }
-                    Check(Exchange(name, "1\ty\t\tstatus\t\n").Contains("Read"), "切断後復帰");
+                    Check(Exchange(name, "2\ty\t\tstatus\t\n").Contains("Read"), "切断後復帰");
                 }
             }
         }
@@ -402,7 +533,7 @@ namespace MouseWakeSuppressor
                             {
                                 byte[] buffer = new byte[4096]; pipe.Read(buffer, 0, buffer.Length);
                                 if (endpoint.EndsWith("-slow")) Thread.Sleep(1500);
-                                else { byte[] partial = Encoding.UTF8.GetBytes("1\tincomplete"); pipe.Write(partial, 0, partial.Length); }
+                                else { byte[] partial = Encoding.UTF8.GetBytes("2\tincomplete"); pipe.Write(partial, 0, partial.Length); }
                             }
                             catch (IOException) { }
                         }

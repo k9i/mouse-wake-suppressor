@@ -11,11 +11,12 @@ global g_batteryInterval := Setting("BatteryPollIntervalMs", 5000, 100)
 global g_fast := Setting("OperationPollIntervalMs", 100, 20)
 global g_boot := "", g_pending := 0, g_commands := [], g_next := 0, g_lastTray := ""
 global g_handles := [], g_sessionSeen := false, g_sequence := 0, g_admin := 0, g_pumpDue := 0
-global g_console := GuidBuffer("{6FE69556-704A-47A0-8F24-C2C28D936FDA}")
+global g_console := GuidBuffer("{6FE69556-704A-47A0-8F24-C28D936FDA47}")
 global g_session := GuidBuffer("{2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5}")
 global g_powerSource := GuidBuffer("{5D3E9A59-E9D5-4B00-A6BD-FF34FF516548}")
 global g_onBattery := OnBatteryPower()
 global g_selection := 0
+global g_lockStatus := "接続待ち"
 global g_initialSelection := IniRead(g_config, "Devices", "InstanceIds", "") = ""
 
 ShowTray("Unknown", "接続待ち")
@@ -171,7 +172,7 @@ Pump() {
     }
     watch := g_pending ? g_pending.id : ""
     g_next := now + MwsPollInterval(g_onBattery, g_pending, g_interval, g_batteryInterval, g_fast)
-    g_client.Send("1`t" id "`t" g_boot "`t" command "`t" watch "`n", Receive.Bind(id, command, manual))
+    g_client.Send("2`t" id "`t" g_boot "`t" command "`t" watch "`n", Receive.Bind(id, command, manual))
     if g_admin
         SchedulePump(250)
 }
@@ -179,6 +180,7 @@ Pump() {
 ; 完了通知は送信した request と同じ boot に限定する。
 Receive(id, command, manual, text, error) {
     global g_boot, g_pending, g_next, g_fast, g_initialSelection, g_commands
+    global g_lockStatus
     if error != "" {
         service := ServiceState()
         label := service = 0 ? "サービス未インストール" : service = 1 ? "サービス停止" : service = 2 || service = 3 ? "サービス移行中" : "通信不能"
@@ -188,6 +190,7 @@ Receive(id, command, manual, text, error) {
     }
     try {
         state := MwsParse(text, id)
+        g_lockStatus := state.lockDisplay
         g_boot := state.boot
         completion := MwsCompletion(state, g_pending, command)
         if completion.clear {
@@ -199,9 +202,14 @@ Receive(id, command, manual, text, error) {
         detail := state.stopping ? "停止処理中" : state.active != "" ? "処理中: " state.active : state.scheduled ? "無効化予約中" : ""
         if state.error != ""
             detail .= " / " state.error
+        detail .= " / LockDisplay: " state.lockDisplay
         ShowTray(state.state, detail, state.devices)
         if command = "enumerate" && state.accepted = "Read"
             SelectDevices(state.devices)
+        if command = "keyboards" && state.accepted = "Read"
+            SelectKeyboards(state.devices)
+        if command = "lock-probe"
+            TrayTip(state.accepted = "Accepted" ? "入力診断を開始しました。5 分以内にロックして確認してください。消灯要求は送りません。" : "入力診断を開始できません。LockDisplay の監視状態を確認してください。", "LockDisplay")
         if g_initialSelection && state.active = "" && state.error = "" && state.accepted = "Read" {
             g_initialSelection := false
             Request("enumerate")
@@ -244,12 +252,21 @@ ShowTray(state, detail, devices := []) {
         A_TrayMenu.Add(item, ShowDevice.Bind(d))
     }
     A_TrayMenu.Add("対象マウスを選択", (*) => Request("enumerate"))
+    A_TrayMenu.Add("ロック中の消灯設定", (*) => Request("keyboards"))
+    A_TrayMenu.Add("消灯せず入力を診断 (5 分間)", (*) => Request("lock-probe"))
+    A_TrayMenu.Add("LockDisplay の監視状態", ShowLockStatus)
     A_TrayMenu.Add("設定をリロード", (*) => Request("reload", true))
     A_TrayMenu.Add("復旧して設定をリセット", (*) => Request("reset", true))
     A_TrayMenu.Add()
     for action in ["install", "start", "stop", "restart", "uninstall"]
         A_TrayMenu.Add("サービス: " action, AdminAction.Bind(action))
     A_TrayMenu.Add("終了", (*) => ExitApp())
+}
+
+; 詳細は必要なときだけ表示し、トレイの短い状態表示と分ける。
+ShowLockStatus(*) {
+    global g_lockStatus
+    MsgBox(g_lockStatus, "LockDisplay")
 }
 
 ; 詳細は必要なときだけ表示し、トレイの短い状態表示と分ける。
@@ -277,6 +294,52 @@ SelectDevices(devices) {
     window.AddButton("Default", "保存").OnEvent("Click", SaveSelection.Bind(window, list, devices))
     window.OnEvent("Close", CloseSelection.Bind(window))
     window.Show()
+}
+
+; 同じ値は INI に書き戻さず、復旧対象はサービスに保持させる。
+SelectKeyboards(devices) {
+    global g_selection, g_config
+    if g_selection
+        return
+    window := Gui(, "Mouse Wake Suppressor - LockDisplay")
+    g_selection := window
+    window.AddText(, "ローカルの物理キーボードだけを選択してください。Parsec などの virtual device は選択しないでください。")
+    list := window.AddListView("w900 r12 Checked", ["名前", "メーカー", "状態", "Instance ID"])
+    selected := "|" IniRead(g_config, "LockDisplay", "KeyboardInstanceIds", "") "|"
+    for d in devices
+        list.Add(InStr(selected, "|" d.id "|") ? "Check" : "", d.name, d.manufacturer, d.state, d.id)
+    list.ModifyCol()
+    enabled := window.AddCheckbox(, "ロック中のキーボード無入力で消灯する")
+    enabled.Value := IniRead(g_config, "LockDisplay", "Enabled", "0") = "1"
+    window.AddText(, "待機秒数 (1..600)")
+    idle := window.AddEdit("Number w120", IniRead(g_config, "LockDisplay", "IdleTimeoutSeconds", "30"))
+    window.AddText(, "再試行間隔 ms (1000..600000)")
+    retry := window.AddEdit("Number w120", IniRead(g_config, "LockDisplay", "RetryIntervalMs", "1000"))
+    window.AddButton("Default", "保存").OnEvent("Click", SaveKeyboards.Bind(window, list, devices, enabled, idle, retry))
+    window.OnEvent("Close", CloseSelection.Bind(window))
+    window.Show()
+}
+
+; 複数キーの更新途中では有効化せず、完成した設定だけを service に使用させる。
+SaveKeyboards(window, list, devices, enabled, idle, retry, *) {
+    global g_config
+    ids := "", row := 0
+    while row := list.GetNext(row, "Checked")
+        ids .= (ids = "" ? "" : "|") devices[row].id
+    problem := MwsLockSettingsError(enabled.Value, ids, idle.Value, retry.Value)
+    if problem != "" {
+        MsgBox(problem, "LockDisplay", "Iconx")
+        return
+    }
+    try {
+        ; section 単位で置き換え、旧 timeout と新 ID の混在を避ける。
+        section := "Enabled=" enabled.Value "`nIdleTimeoutSeconds=" idle.Value "`nRetryIntervalMs=" retry.Value "`nKeyboardInstanceIds=" ids
+        IniWrite(section, g_config, "LockDisplay")
+        CloseSelection(window)
+        Request("reload", true)
+    } catch as err {
+        MsgBox("設定保存に失敗しました: " err.Message, "LockDisplay", "Iconx")
+    }
 }
 
 ; 同じ値は INI に書き戻さず、復旧対象はサービスに保持させる。

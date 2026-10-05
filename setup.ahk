@@ -141,7 +141,7 @@ MwsSetupOutputIsStale(binaryTime, inputTimes) {
 
 ; repository の build input を列挙し、source 不足と compiler failure を区別する。
 MwsSetupPrepareBuild(sourceDir) {
-    inputs := ["build.cmd", "MouseWakeSuppressorService.cs", "Core.cs", "WindowsPlatform.cs", "Ipc.cs"]
+    inputs := ["build.cmd", "MouseWakeSuppressorService.cs", "Core.cs", "WindowsPlatform.cs", "Ipc.cs", "LockDisplay.cs", "LockNative.cs", "LockDisplayHost.cs", "LockInputHelper.cs"]
     times := []
     for name in inputs {
         path := sourceDir "\" name
@@ -257,7 +257,7 @@ MwsSetupStatus(expectedDir, repositoryMode) {
 
 ; status では source 不足も build が必要な状態として報告する。
 MwsSetupBuildRequired(sourceDir) {
-    inputs := ["build.cmd", "MouseWakeSuppressorService.cs", "Core.cs", "WindowsPlatform.cs", "Ipc.cs"]
+    inputs := ["build.cmd", "MouseWakeSuppressorService.cs", "Core.cs", "WindowsPlatform.cs", "Ipc.cs", "LockDisplay.cs", "LockNative.cs", "LockDisplayHost.cs", "LockInputHelper.cs"]
     times := []
     for name in inputs {
         path := sourceDir "\" name

@@ -2,6 +2,8 @@
 
 モニターの消灯時に選択した Mouse クラスのデバイスを無効化し、マウスの微振動による再点灯を防ぐ Windows 用ツールです。キーボードで点灯・アンロックしたときにマウスを復旧します。AutoHotkey v2 の UI と、LocalSystem で動く C# サービスで構成します。
 
+任意で、active console session のロック中に登録キーボードの入力が 30 秒なければモニター OFF を要求できます。この機能は既定で無効です。初回は消灯なしの入力診断を行ってください。
+
 ## 要件
 
 - Windows 10 version 2004 以降、または Windows 11。[PnPUtil の enable/disable-device の対応 OS](https://learn.microsoft.com/en-us/windows-hardware/drivers/devtest/pnputil-command-syntax)に合わせています。
@@ -120,6 +122,12 @@ AutomaticDisableDelayMs=5000
 OperationTimeoutMs=5000
 InformationLog=0
 
+[LockDisplay]
+Enabled=0
+IdleTimeoutSeconds=30
+RetryIntervalMs=1000
+KeyboardInstanceIds=
+
 [UI]
 PollIntervalMs=1000
 BatteryPollIntervalMs=5000
@@ -139,15 +147,48 @@ AHK の `Pump()` は one-shot timer で必要な時刻にだけ起動します�
 
 ローカル専用 named pipe `MouseWakeSuppressor-v1` を使用します。一般ユーザーは接続できますが、remote 接続と pipe instance の作成権限は許可しません。操作名は固定で、任意コマンドや executable path は受け付けません。
 
-protocol は UTF-8 の 1 行、tab 区切りです。request は `version / request ID / boot ID / command / 照会する operation ID` の 5 フィールドです。文字列の結果・device 情報は Base64 で encode します。command は `status / enumerate / toggle / enable / disable / schedule / reload / reset` です。変更要求は現在の boot ID が必要です。
+protocol version は `2` です。endpoint 名は旧版との接続時に明示的な version mismatch を返すため維持しています。service と AHK file を同時更新し、起動済みの AHK も終了して通常ユーザーで起動し直してください。
 
-response は `version / request ID / boot ID / 受付結果 / 集約状態 / 実行中操作 / 予約 / 停止中 / エラー / operation ID / 操作結果 / メッセージ / デバイス一覧` の 13 フィールドです。デバイス行は `;`、その列は `,` 区切りで、`ID / 名前 / メーカー / 実状態 / 復旧要否 / 操作詳細` を返します。
+protocol は UTF-8 の 1 行、tab 区切りです。request は `version / request ID / boot ID / command / 照会する operation ID` の 5 フィールドです。文字列の結果・device 情報は Base64 で encode します。command は `status / enumerate / keyboards / lock-probe / toggle / enable / disable / schedule / reload / reset` です。変更要求は現在の boot ID が必要です。`keyboards` は選択用の Keyboard クラス一覧を返し、`lock-probe` は 5 分間の入力診断を予約します。診断は `Enabled=0` かつキーボード選択済みの場合だけ受け付け、operation 履歴は作らず受付結果と監視状態で通知します。
+
+response は `version / request ID / boot ID / 受付結果 / 集約状態 / 実行中操作 / 予約 / 停止中 / エラー / operation ID / 操作結果 / メッセージ / デバイス一覧 / LockDisplay 監視状態` の 14 フィールドです。監視状態は Base64 です。デバイス行は `;`、その列は `,` 区切りで、`ID / 名前 / メーカー / 実状態 / 復旧要否 / 操作詳細` を返します。
 
 完了結果は直近 256 件をメモリに保持します。サービス再起動や結果の失効、応答 timeout は成功扱いにしません。AHK は `CreateFile`、overlapped `WriteFile / ReadFile` と `CancelIoEx` を使い、接続から応答完了までを timer で制限します。[CallNamedPipe の timeout は接続待ちにしか適用されない](https://learn.microsoft.com/en-us/windows/win32/api/namedpipeapi/nf-namedpipeapi-callnamedpipew)ため使用しません。
 
 従来の SCM custom command `128..132` は、順に toggle、enable、disable、reload、schedule として同じ worker に接続しています。
 
 ## 検証範囲
+
+### ロック中の消灯制御
+
+`LockDisplay` は Windows の idle timeout や対象アプリの起動有無とは独立しています。`IdleTimeoutSeconds` は `1..600` 秒、`RetryIntervalMs` は `1000..600000` ms で、既定値は `30` 秒と `1000` ms です。`Enabled` は `0` または `1`、`KeyboardInstanceIds` は `|` 区切りです。未登録での有効化や不正な設定は監視停止として表示します。設定は独立した監視 thread が 500 ms ごとに再読込し、消灯前の lease 更新でも再確認します。
+
+トレイの「ロック中の消灯設定」で物理キーボードだけを選択します。マウス、device handle のない synthetic input、登録していない virtual keyboard は期限を延長しません。Parsec が登録した物理 keyboard と同じ device として入力を注入する環境では区別を保証できません。必ず入力診断で確認してください。
+
+対象はログオン済みの active console session のロック中です。時計表示と認証画面の間の正常な desktop 切替では期限を延長しません。アンロック中の UAC desktop とログオン前には OFF を要求しません。ロック通知の受信時刻を起点とし、service 再起動時は監視開始から計測します。登録入力だけが期限を更新します。通知や API の処理時間により、要求時刻には遅延が生じます。
+
+service は session 内に同一 executable の LocalSystem helper を起動します。[desktop のアクセス制約](https://learn.microsoft.com/en-us/windows/win32/winstation/desktops)に従って入力 desktop を開き、切替時には受信 thread、window、Raw Input 登録を作り直します。IME などの補助 window によって desktop の再割当が拒否される場合があるため、旧 thread を終了してから新しい thread を割り当てます。正常な切替では入力時刻と期限を維持します。Raw Input は header の device handle だけを読み、文字、キー値、キー列は保存も送信もしません。device interface を SetupAPI で Instance ID に解決し、選択済み ID と比較します。
+
+helper の named pipe は起動ごとに別名で作成し、LocalSystem だけを許可します。service と helper は相互に PID、session、世代を照合します。helper は通常 250 ms ごと、消灯の直前にも lease を更新し、通信断で終了します。service は heartbeat の途絶または異常終了時に helper を回収して再起動します。ロック判定、Raw Input、desktop の監視失敗では OFF を停止し、復旧後に待機時間を数え直します。マウス制御の worker、予約、取消世代は共有しません。
+
+[SC_MONITORPOWER](https://learn.microsoft.com/en-us/windows/win32/menurc/wm-syscommand) の OFF 要求後、[GUID_CONSOLE_DISPLAY_STATE](https://learn.microsoft.com/en-us/windows/win32/power/power-setting-guids) (`6FE69556-704A-47A0-8F24-C28D936FDA47`) の OFF 通知を待ちます。送信成功だけでは消灯成功と表示しません。未確認なら設定間隔で再試行し、3 回以上未確認の場合は Warning を出します。同じ警告は 5 分間抑制します。OFF 後に入力なしで ON / dim 通知を受けた場合は設定間隔の猶予後に再要求し、その間に登録入力を受けた場合は取り消します。物理モニターの消灯は OS / driver に依存します。
+
+### 実機への導入手順
+
+service 更新、ロック、消灯、対象アプリの停止は利用者の確認後に行います。
+
+1. `setup.ahk install` で service と UI file を更新し、AHK を通常ユーザーで起動し直します。`Enabled=0` のまま対象の物理キーボードを選択します。
+2. 「消灯せず入力を診断 (5 分間)」を選択してロックします。この診断中は本機能から OFF を送りません。Windows 標準の timeout はそのままです。
+3. 登録キーボードの Shift などを押し、1 秒以上待ってからアンロックします。「LockDisplay の監視状態」の前回記録で監視成功と入力時刻の更新を確認します。入力時刻は起動後の単調時計の ms、`0` はその監視期間に登録入力を受信していないことを示します。文字は記録しません。
+4. 同じ診断を Parsec のみの入力と、マウスのみの入力で繰り返します。登録入力として記録されないことを確認します。判別できない場合や secure desktop で受信できない場合は `Enabled=0` を維持し、その環境を未対応として扱います。
+5. 診断成立後に有効化し、`doaxvv.exe` / Parsec の停止、各単独起動、同時起動、Parsec 接続中を比較します。30 秒の要求、物理消灯、入力なしの再点灯後の再消灯、キー復帰、認証、マウス復旧を確認します。
+6. キーボードの再接続、helper の異常終了、service 再起動、期限直前のアンロック、ログオフ、session 切替を確認します。監視異常の表示と、復旧時の新たな待機時間も確認します。
+
+自動テストはロック消灯の期限、対象入力の延長、対象外入力の除外、再点灯の猶予、未確認時の再試行、世代取消、監視復旧後の再計測、設定検証を模擬時刻で確認します。通常 desktop で Raw Input interface と Keyboard クラスの Instance ID を読み取り専用で照合します。LocalSystem helper の secure desktop 上での入力受信、実際の異常終了と再起動、Parsec との識別、物理消灯は実機試験が必要です。
+
+2026-10-05 の実機診断では、`Enabled=0` の入力診断で、利用者による物理キーボードの Shift、Space、Shift、アンロックを実施しました。`Default` と `Winlogon` の両 desktop で登録入力を検出し、切替後も監視を継続しました。初回診断で発生した同一 thread の desktop 再割当エラーは、受信 thread を作り直す修正後には再発せず、アンロック後のマウス復旧も確認しました。この結果は Parsec 入力の除外や物理消灯の確認を含みません。
+
+2026-10-06 には、この PC を Parsec client として別 PC の server に接続した状態で強制消灯を試験しました。desktop 切替時に Raw Input handle の変更を再接続と誤判定して入力時刻を消す問題を修正し、Instance ID が同じ場合は期限を維持、新 desktop の入力を受け取る前に handle を再照合するようにしました。C# 27 テストと AHK テストを通過した修正版で、00:15:50 のロックから 00:16:20 の OFF 要求 1 回と OFF 通知まで約 30 秒でした。利用者が物理消灯、Ctrl 1 回での点灯、アンロックを確認し、記録でも入力時刻の保持とマウス復旧を確認しました。試験後は `Enabled=0` に復元しています。利用者の報告では初回試験でも無入力約 30 秒後の再消灯がありましたが、最初の Shift 1 回で点灯しなかった理由は未特定です。固定キーの確認を誘発しないよう、今後の試験では Ctrl を使用します。入力なしの外因による再点灯後の自動再消灯、実際の helper 異常終了、service 再起動、キーボード再接続は別途実機確認が必要です。
 
 自動テストでは、成功、部分失敗、開始失敗、timeout、切断、記録保存失敗、起動復旧、移行、設定変更・reset、重複予約、取消 callback、逆方向要求、停止中の受付拒否、IPC version・boot・切断、ログ抑制、書き込み回数を確認します。AHK は構文と模擬サービスによる通信・トレイ表示値・通知判定・応答待ち中の timer 動作を検証します。
 

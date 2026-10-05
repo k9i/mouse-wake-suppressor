@@ -1,4 +1,15 @@
 ; トレイ表示を純粋な変換にし、模擬サービスの状態で検証可能にする。
+MwsLockSettingsError(enabled, ids, idle, retry) {
+    if enabled && ids = ""
+        return "先に対象キーボードを選択してください。"
+    if !IsInteger(idle) || idle < 1 || idle > 600
+        return "待機秒数は 1..600 の整数で指定してください。"
+    if !IsInteger(retry) || retry < 1000 || retry > 600000
+        return "再試行間隔は 1000..600000 ms の整数で指定してください。"
+    return ""
+}
+
+; トレイ表示を純粋な変換にし、模擬サービスの状態で検証可能にする。
 MwsPresentation(state, detail) {
     labels := Map("Enabled", "有効", "Disabled", "無効", "Partial", "一部無効", "Unknown", "状態不明")
     label := labels.Has(state) ? labels[state] : "状態不明"

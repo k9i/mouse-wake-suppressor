@@ -12,6 +12,7 @@ namespace MouseWakeSuppressor
     {
         private Engine engine;
         private PipeServer pipe;
+        private LockDisplayHost lockDisplay;
         /// <summary>SCM から受け取る通知を設定します。</summary>
         public MouseWakeSuppressorService()
         {
@@ -24,14 +25,22 @@ namespace MouseWakeSuppressor
         {
             engine = new Engine(new WindowsDevices(), new RecoveryFile(), new IniConfig(AppDomain.CurrentDomain.BaseDirectory), new Scheduler(), Log);
             engine.Start();
-            try { pipe = new PipeServer(engine); }
-            catch { engine.Stop(); throw; }
+            try
+            {
+                lockDisplay = new LockDisplayHost(new IniConfig(AppDomain.CurrentDomain.BaseDirectory), Log);
+                engine.LockStatus = lockDisplay.Read;
+                engine.LockProbe = lockDisplay.Probe;
+                engine.Keyboards = () => new WindowsDevices(true).Enumerate();
+                pipe = new PipeServer(engine);
+            }
+            catch { if (lockDisplay != null) lockDisplay.Dispose(); engine.Stop(); throw; }
         }
         protected override void OnStop()
         { StopEngine(true); }
         private void StopEngine(bool notifyScm)
         {
             if (engine == null) return;
+            if (lockDisplay != null) { lockDisplay.Dispose(); lockDisplay = null; }
             engine.BeginStop();
             if (pipe != null) pipe.Dispose();
             // 復旧中に SCM へ停止完了を返さない。
@@ -42,6 +51,8 @@ namespace MouseWakeSuppressor
         protected override void OnShutdown() { StopEngine(false); }
         protected override void OnSessionChange(SessionChangeDescription change)
         {
+            if (lockDisplay != null) lockDisplay.SessionChanged(change.SessionId, change.Reason == SessionChangeReason.SessionLock);
+            if (engine == null) return;
             if (change.Reason == SessionChangeReason.SessionLock) engine.Schedule();
             else if (change.Reason == SessionChangeReason.SessionUnlock || change.Reason == SessionChangeReason.SessionLogoff)
                 engine.Submit("enable", Guid.NewGuid().ToString("N"));
@@ -76,6 +87,7 @@ namespace MouseWakeSuppressor
     {
         private static int Main(string[] args)
         {
+            if (args.Length > 0 && args[0] == "--lock-helper") return LockInputHelper.Run(args);
             // 対話 CLI と SCM 起動を区別する。
             if (args.Length == 0 && !Environment.UserInteractive) { ServiceBase.Run(new MouseWakeSuppressorService()); return 0; }
             if (args.Length != 1 || args[0] == "--help")

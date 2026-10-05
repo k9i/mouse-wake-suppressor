@@ -32,6 +32,18 @@ namespace MouseWakeSuppressor
                 throw new InvalidDataException(key + " は " + minimum + " から 600000 の整数で指定してください。");
             return value;
         }
+        internal LockSettings LoadLock()
+        {
+            string enabled = Read("LockDisplay", "Enabled", "0");
+            int idle, retry;
+            if ((enabled != "0" && enabled != "1") ||
+                !int.TryParse(Read("LockDisplay", "IdleTimeoutSeconds", "30"), out idle) ||
+                !int.TryParse(Read("LockDisplay", "RetryIntervalMs", "1000"), out retry))
+                throw new InvalidDataException("LockDisplay の設定値が不正です。");
+            var result = new LockSettings { Enabled = enabled == "1", IdleSeconds = idle, RetryMs = retry,
+                Keyboards = Read("LockDisplay", "KeyboardInstanceIds", "").Split('|').Select(s => s.Trim()).Where(s => s != "").Distinct(StringComparer.OrdinalIgnoreCase).ToList() };
+            result.Validate(); return result;
+        }
         /// <summary>設定の不正を検出し、安全な操作だけに使用します。</summary>
         public Settings Load()
         {
@@ -139,11 +151,14 @@ namespace MouseWakeSuppressor
     internal sealed class WindowsDevices : IDevices
     {
         private static readonly Guid MouseClass = new Guid("4d36e96f-e325-11ce-bfc1-08002be10318");
+        private readonly Guid deviceClass;
+        internal WindowsDevices() : this(false) { }
+        internal WindowsDevices(bool keyboards) { deviceClass = keyboards ? new Guid("4d36e96b-e325-11ce-bfc1-08002be10318") : MouseClass; }
         [StructLayout(LayoutKind.Sequential)] private struct DeviceInfo { internal uint Size; internal Guid Class; internal uint Instance; internal IntPtr Reserved; }
         /// <summary>SetupAPI で Mouse クラスのデバイスを列挙します。</summary>
         public List<Device> Enumerate()
         {
-            Guid guid = MouseClass;
+            Guid guid = deviceClass;
             // 未接続も含めることで初回移行の復旧対象を失わない。
             IntPtr set = SetupDiGetClassDevs(ref guid, null, IntPtr.Zero, 0);
             if (set == new IntPtr(-1)) throw new Win32Exception(Marshal.GetLastWin32Error());
@@ -186,6 +201,7 @@ namespace MouseWakeSuppressor
         /// <summary>終了コードと両出力を回収し、期限切れの子プロセスを残しません。</summary>
         public Execution Run(string id, bool enable, int timeout, Func<bool> cancel)
         {
+            if (deviceClass != MouseClass) throw new InvalidOperationException("キーボードの状態変更は禁止しています。");
             IniConfig.ValidateId(id);
             if (!Enumerate().Any(d => String.Equals(d.Id, id, StringComparison.OrdinalIgnoreCase)))
                 return new Execution { Error = "Mouse クラスに見つかりません。復旧対象を保持します。" };

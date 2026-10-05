@@ -21,25 +21,30 @@ namespace MouseWakeSuppressor
             string id = fields.Length > 1 ? fields[1] : "";
             Snapshot state = engine.Read(fields.Length == 5 ? fields[4] : "");
             string accepted = "Rejected";
-            if (fields.Length == 5 && fields[0] == "1" && ValidId(id))
+            if (fields.Length == 5 && fields[0] == "2" && ValidId(id))
             {
-                if (fields[3] == "status" || fields[3] == "enumerate") accepted = "Read";
+                if (fields[3] == "status" || fields[3] == "enumerate" || fields[3] == "keyboards") accepted = "Read";
                 else if (fields[2] == state.Boot)
                 {
-                    accepted = engine.Submit(fields[3], id);
+                    accepted = fields[3] == "lock-probe" ? engine.LockProbe() : engine.Submit(fields[3], id);
                     state = engine.Read(id);
                 }
                 else accepted = "Restarted";
             }
-            else if (fields.Length > 0 && fields[0] != "1") accepted = "VersionMismatch";
+            else if (fields.Length > 0 && fields[0] != "2") accepted = "VersionMismatch";
             Operation op = state.Operation;
             var devices = fields.Length == 5 && fields[3] == "enumerate" ? state.Available : state.Devices;
+            if (accepted == "Read" && fields[3] == "keyboards")
+            {
+                try { devices = engine.Keyboards(); }
+                catch (Exception ex) { accepted = "Rejected"; state.Error = ex.Message; devices = new List<Device>(); }
+            }
             string rows = String.Join(";", devices.Select(d => String.Join(",", new[] {
                 Encode(d.Id), Encode(d.Name), Encode(d.Manufacturer), d.State.ToString(), d.Recovery ? "1" : "0", Encode(d.Result) })).ToArray());
             // 受付と実行結果を別フィールドにして、受付だけで成功通知させない。
-            string response = String.Join("\t", new[] { "1", id, state.Boot, accepted, state.State,
+            string response = String.Join("\t", new[] { "2", id, state.Boot, accepted, state.State,
                 state.Active, state.Scheduled ? "1" : "0", state.Stopping ? "1" : "0", Encode(state.Error),
-                op == null ? "" : op.Id, op == null ? "Missing" : op.Result, Encode(op == null ? "" : op.Message), rows }) + "\n";
+                op == null ? "" : op.Id, op == null ? "Missing" : op.Result, Encode(op == null ? "" : op.Message), rows, Encode(engine.LockStatus()) }) + "\n";
             if (Encoding.UTF8.GetByteCount(response) > Limit) throw new IOException("IPC 応答が上限を超えています。");
             return response;
         }
@@ -51,6 +56,7 @@ namespace MouseWakeSuppressor
         private readonly Engine engine;
         private readonly string name;
         private readonly string sddl;
+        private readonly Func<string, uint, string> handler;
         private readonly object gate = new object();
         private readonly List<NamedPipeServerStream> streams = new List<NamedPipeServerStream>();
         private readonly List<Thread> threads = new List<Thread>();
@@ -59,8 +65,10 @@ namespace MouseWakeSuppressor
         internal PipeServer(Engine engine) : this(engine, "MouseWakeSuppressor-v1") { }
         internal PipeServer(Engine engine, string name) : this(engine, name, "D:P(A;;GA;;;SY)(A;;GA;;;BA)(A;;0x00120183;;;BU)") { }
         internal PipeServer(Engine engine, string name, string sddl)
+            : this(engine, name, sddl, null) { }
+        internal PipeServer(Engine engine, string name, string sddl, Func<string, uint, string> handler)
         {
-            this.engine = engine; this.name = name; this.sddl = sddl;
+            this.engine = engine; this.name = name; this.sddl = sddl; this.handler = handler;
             // 最初の instance を排他的に作成し、既存の偽サーバーとの共存を拒否する。
             try
             {
@@ -109,7 +117,9 @@ namespace MouseWakeSuppressor
                     }
                     string request = new UTF8Encoding(false, true).GetString(input.ToArray());
                     if (request.IndexOf('\n') != request.Length - 1) throw new IOException("複数の要求は受け付けません。");
-                    byte[] response = Encoding.UTF8.GetBytes(Protocol.Reply(engine, request));
+                    uint client = 0;
+                    if (handler != null && !GetNamedPipeClientProcessId(stream.SafePipeHandle, out client)) throw new IOException("helper の PID を確認できません。");
+                    byte[] response = Encoding.UTF8.GetBytes(handler == null ? Protocol.Reply(engine, request) : handler(request, client));
                     IAsyncResult write = stream.BeginWrite(response, 0, response.Length, null, null);
                     Complete(stream, write, () => { stream.EndWrite(write); return 0; }, clock);
                     // EndWrite は相手の受信完了ではない。相手の close を期限内だけ待ち、
@@ -158,5 +168,6 @@ namespace MouseWakeSuppressor
         [DllImport("advapi32.dll", CharSet = CharSet.Unicode, SetLastError = true)] private static extern bool ConvertStringSecurityDescriptorToSecurityDescriptor(string sddl, uint revision, out IntPtr descriptor, out uint size);
         [DllImport("kernel32.dll")] private static extern IntPtr LocalFree(IntPtr memory);
         [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CancelIoEx(SafePipeHandle pipe, IntPtr overlapped);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool GetNamedPipeClientProcessId(SafePipeHandle pipe, out uint process);
     }
 }

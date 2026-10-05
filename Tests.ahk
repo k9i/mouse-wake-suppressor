@@ -15,6 +15,11 @@ global endpoint := "MwsAhkTest-" DllCall("GetCurrentProcessId") "-" A_TickCount
 global client := MwsClient(endpoint, 500), sequence := 0, beats := 0
 SetTimer(Heartbeat, 10)
 try {
+    Check(MwsLockSettingsError(true, "", "30", "1000") != "", "キーボード未選択では有効化しない")
+    Check(MwsLockSettingsError(false, "", "30", "1000") = "", "既定は無効")
+    Check(MwsLockSettingsError(true, "HID\A", "0", "1000") != "", "待機秒数下限")
+    Check(MwsLockSettingsError(true, "HID\A", "30", "999") != "", "再試行間隔下限")
+    Check(MwsLockSettingsError(true, "HID\A", "30", "1000") = "", "有効な消灯設定")
     parsed := MwsSetupParseArgs(["install"])
     Check(parsed.command = "install" && !parsed.elevated && parsed.error = "", "setup 引数解析")
     g_mwsSetupConsole := false, g_mwsSetupOutput := "", g_mwsSetupError := false
@@ -101,7 +106,7 @@ Exchange(command, boot := "", watch := "") {
     global client, sequence
     id := "ahk-" (++sequence)
     result := {done: false, text: "", error: "", id: id}
-    Check(client.Send("1`t" id "`t" boot "`t" command "`t" watch "`n", (text, error) => (result.text := text, result.error := error, result.done := true)), "重複送信")
+    Check(client.Send("2`t" id "`t" boot "`t" command "`t" watch "`n", (text, error) => (result.text := text, result.error := error, result.done := true)), "重複送信")
     Check(!client.Send("duplicate", (*) => 0), "重複要求を防止")
     start := A_TickCount
     while !result.done {

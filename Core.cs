@@ -66,6 +66,9 @@ namespace MouseWakeSuppressor
     // 外部処理は worker 専用。gate 内ではメモリだけを更新し、IPC を待たせない。
     internal sealed class Engine : IDisposable
     {
+        internal Func<string> LockStatus = () => "無効";
+        internal Func<List<Device>> Keyboards = () => new List<Device>();
+        internal Func<string> LockProbe = () => "Rejected";
         private readonly object gate = new object();
         private readonly IDevices hardware;
         private readonly IRecovery journal;

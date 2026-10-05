@@ -14,7 +14,7 @@ if not exist "%MWS_CSC%" (
     exit /b 69
 )
 pushd "%~dp0" || exit /b 74
-"%MWS_CSC%" /nologo /target:exe /out:MouseWakeSuppressorService.exe /reference:System.ServiceProcess.dll,System.dll,System.Core.dll,System.Configuration.Install.dll MouseWakeSuppressorService.cs Core.cs WindowsPlatform.cs Ipc.cs > __build.log 2>&1
+"%MWS_CSC%" /nologo /target:exe /out:MouseWakeSuppressorService.exe /reference:System.ServiceProcess.dll,System.dll,System.Core.dll,System.Configuration.Install.dll MouseWakeSuppressorService.cs Core.cs WindowsPlatform.cs Ipc.cs LockDisplay.cs LockNative.cs LockDisplayHost.cs LockInputHelper.cs > __build.log 2>&1
 if not "!errorlevel!"=="0" (
     type __build.log 1>&2
     popd
