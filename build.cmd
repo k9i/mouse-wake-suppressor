@@ -1,17 +1,25 @@
 @echo off
 setlocal EnableDelayedExpansion
-set DIR=%~dp0
-set CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
-if not exist "%CSC%" (
-    echo ERROR: .NET Framework 4 compiler not found: %CSC%
-    echo Please install .NET Framework 4.x and retry.
-    exit /b 1
+if "%~1"=="--build" goto build
+echo Builds the Mouse Wake Suppressor service.
+echo Usage: build.cmd --build
+echo Set the compiler path with the MWS_CSC environment variable.
+if "%~1"=="--help" exit /b 0
+exit /b 64
+:build
+if not "%~2"=="" exit /b 64
+if not defined MWS_CSC set "MWS_CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+if not exist "%MWS_CSC%" (
+    echo The .NET Framework compiler was not found. 1>&2
+    exit /b 69
 )
-"%CSC%" /target:exe /out:"%DIR%MouseWakeSuppressorService.exe" /reference:System.ServiceProcess.dll,System.dll,System.Configuration.Install.dll,System.Windows.Forms.dll,System.Drawing.dll "%DIR%MouseWakeSuppressorService.cs"
-set BUILD_EXIT=!ERRORLEVEL!
-if !BUILD_EXIT! neq 0 (
-    echo BUILD FAILED - exit code !BUILD_EXIT!
-    exit /b !BUILD_EXIT!
+pushd "%~dp0" || exit /b 74
+"%MWS_CSC%" /nologo /target:exe /out:MouseWakeSuppressorService.exe /reference:System.ServiceProcess.dll,System.dll,System.Core.dll,System.Configuration.Install.dll MouseWakeSuppressorService.cs Core.cs WindowsPlatform.cs Ipc.cs LockDisplay.cs LockNative.cs LockDisplayHost.cs LockInputHelper.cs > __build.log 2>&1
+if not "!errorlevel!"=="0" (
+    type __build.log 1>&2
+    popd
+    exit /b 65
 )
-echo BUILD SUCCEEDED: %DIR%MouseWakeSuppressorService.exe
-endlocal
+popd
+echo Build completed.
+exit /b 0
