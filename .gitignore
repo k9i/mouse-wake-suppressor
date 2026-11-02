@@ -3,6 +3,7 @@
 *.InstallLog
 *.InstallState
 mws_state.txt
+/dist/
 __*
 *__
 *__.*

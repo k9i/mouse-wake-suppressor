@@ -92,7 +92,7 @@ namespace MouseWakeSuppressor
             if (args.Length == 0 && !Environment.UserInteractive) { ServiceBase.Run(new MouseWakeSuppressorService()); return 0; }
             if (args.Length != 1 || args[0] == "--help")
             {
-                Console.WriteLine("マウスの復旧を管理する Windows サービスです。\n使い方: MouseWakeSuppressorService.exe -install|-uninstall|-start|-stop|-restart\n管理者権限が必要です。引数なしではこのヘルプを表示します。");
+                Console.WriteLine("マウスの復旧を管理する Windows サービスです。\n使い方: MouseWakeSuppressorService.exe -install|-uninstall\n管理者権限が必要です。引数なしではこのヘルプを表示します。");
                 return args.Length == 1 ? 0 : 64;
             }
             try
@@ -110,9 +110,6 @@ namespace MouseWakeSuppressor
                     if (new RecoveryFile().Load().Count != 0) throw new InvalidOperationException("復旧対象が残っています。再接続後にサービスを開始し、復旧を再試行してください。");
                     ManagedInstallerClass.InstallHelper(new[] { "/u", Assembly.GetExecutingAssembly().Location });
                 }
-                else if (command == "-start") Start();
-                else if (command == "-stop") Stop();
-                else if (command == "-restart") { Stop(); Start(); }
                 else { Console.Error.WriteLine("不明な引数です。--help を参照してください。"); return 64; }
                 Console.WriteLine("操作が完了しました。"); return 0;
             }

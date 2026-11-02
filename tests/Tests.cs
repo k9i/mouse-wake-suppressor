@@ -123,7 +123,7 @@ namespace MouseWakeSuppressor
         }
         private static void LockConfiguration()
         {
-            string directory = Path.Combine(Path.GetTempPath(), "__mws_lock_" + Guid.NewGuid().ToString("N"));
+            string directory = Path.Combine(AppDomain.CurrentDomain.BaseDirectory, "__mws_lock_" + Guid.NewGuid().ToString("N"));
             Directory.CreateDirectory(directory);
             var config = new IniConfig(directory);
             var value = config.LoadLock();
