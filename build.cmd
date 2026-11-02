@@ -1,17 +1,31 @@
 @echo off
 setlocal EnableDelayedExpansion
-set DIR=%~dp0
-set CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe
-if not exist "%CSC%" (
-    echo ERROR: .NET Framework 4 compiler not found: %CSC%
-    echo Please install .NET Framework 4.x and retry.
-    exit /b 1
+if "%~1"=="--build" goto build
+echo Builds the Mouse Wake Suppressor service.
+echo Usage: build.cmd --build
+echo Set MWS_CSC for the compiler and MWS_BUILD_DIR for the output directory.
+if "%~1"=="--help" exit /b 0
+exit /b 64
+:build
+if not "%~2"=="" exit /b 64
+if not defined MWS_CSC set "MWS_CSC=%WINDIR%\Microsoft.NET\Framework64\v4.0.30319\csc.exe"
+if not exist "%MWS_CSC%" (
+    echo The .NET Framework compiler was not found. 1>&2
+    exit /b 69
 )
-"%CSC%" /target:exe /out:"%DIR%MouseWakeSuppressorService.exe" /reference:System.ServiceProcess.dll,System.dll,System.Configuration.Install.dll,System.Windows.Forms.dll,System.Drawing.dll "%DIR%MouseWakeSuppressorService.cs"
-set BUILD_EXIT=!ERRORLEVEL!
-if !BUILD_EXIT! neq 0 (
-    echo BUILD FAILED - exit code !BUILD_EXIT!
-    exit /b !BUILD_EXIT!
+set "workRoot=%TEMP%\codex"
+if defined AGENTS_TEMP if exist "%AGENTS_TEMP%\" set "workRoot=%AGENTS_TEMP%"
+set "workDir=!workRoot!\Codex_mouse-wake-suppressor_build"
+if not exist "!workDir!\" mkdir "!workDir!" || exit /b 74
+if not defined MWS_BUILD_DIR set "MWS_BUILD_DIR=%~dp0dist"
+if not exist "%MWS_BUILD_DIR%\" mkdir "%MWS_BUILD_DIR%" || exit /b 74
+pushd "%~dp0src" || exit /b 74
+"%MWS_CSC%" /nologo /target:exe /out:"%MWS_BUILD_DIR%\MouseWakeSuppressorService.exe" /reference:System.ServiceProcess.dll,System.dll,System.Core.dll,System.Configuration.Install.dll MouseWakeSuppressorService.cs Core.cs WindowsPlatform.cs Ipc.cs LockDisplay.cs LockNative.cs LockDisplayHost.cs LockInputHelper.cs > "!workDir!\build.log" 2>&1
+if not "!errorlevel!"=="0" (
+    type "!workDir!\build.log" 1>&2
+    popd
+    exit /b 65
 )
-echo BUILD SUCCEEDED: %DIR%MouseWakeSuppressorService.exe
-endlocal
+popd
+echo Build completed.
+exit /b 0
