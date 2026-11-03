@@ -89,7 +89,7 @@ namespace MouseWakeSuppressor
         private IDisposable reservation;
         private long generation;
         private volatile bool stopping;
-        private bool corrupt, uncertain, ready;
+        private bool migrationPending, corrupt, uncertain, ready;
         private string active = "startup", error = "";
 
         internal Engine(IDevices hardware, IRecovery journal, IConfig config, IScheduler scheduler, Action<string, LogLevel> log)
@@ -138,7 +138,8 @@ namespace MouseWakeSuppressor
         internal void Schedule() { lock (gate) { if (ready && !stopping) ScheduleLocked(); } }
         private void ScheduleLocked()
         {
-            if (reservation != null || recovery.Count > 0 || active == "disable" || queue.Any(o => o.Command == "disable")) return;
+            bool restoring = active == "enable" || queue.Any(o => o.Command == "enable");
+            if (reservation != null || (!restoring && (recovery.Count > 0 || active == "disable" || queue.Any(o => o.Command == "disable")))) return;
             long expected = ++generation;
             reservation = scheduler.After(settings.Delay, () =>
             {
@@ -187,7 +188,7 @@ namespace MouseWakeSuppressor
                 if (op != null)
                 {
                     try { Execute(op); }
-                    catch (Exception ex) { uncertain = true; Fail(ex); lock (gate) FinishLocked(op, "Failed", ex.Message); }
+                    catch (Exception ex) { Fail(ex); lock (gate) FinishLocked(op, "Failed", ex.Message); }
                     finally { lock (gate) active = ""; }
                 }
                 else
@@ -203,15 +204,14 @@ namespace MouseWakeSuppressor
             // 設定が壊れていても過去の復旧対象を先に読む。
             try { recovery = journal.Load(); }
             catch (Exception ex) { corrupt = true; Fail(ex); }
-            bool migration = !corrupt && !journal.Exists;
+            migrationPending = !corrupt && !journal.Exists;
             bool configLoaded = true;
-            try { settings = config.Load(); } catch (Exception ex) { Fail(ex); uncertain = true; configLoaded = false; }
-            if (migration)
+            try { settings = config.Load(); } catch (Exception ex) { Fail(ex); configLoaded = false; }
+            if (migrationPending)
             {
                 // 旧版の設定を一回だけ復旧する。旧状態ファイルには依存しない。
                 if (!configLoaded) return;
-                foreach (string id in settings.Ids) recovery.Add(id);
-                journal.Save(recovery);
+                Migrate(settings);
             }
             if (!corrupt) Restore();
             Refresh();
@@ -251,7 +251,7 @@ namespace MouseWakeSuppressor
         }
         private string Disable(long expected)
         {
-            if (corrupt || uncertain) throw new InvalidOperationException("復旧記録または実状態が不明なため、新規無効化を禁止しています。有効化を再試行してください。");
+            if (migrationPending || corrupt || uncertain) throw new InvalidOperationException("復旧記録または実状態が不明なため、新規無効化を禁止しています。有効化を再試行してください。");
             settings = config.Load();
             if (settings.Ids.Count == 0) throw new InvalidOperationException("対象マウスが未設定です。トレイメニューから選択してください。");
             var mice = hardware.Enumerate();
@@ -275,8 +275,10 @@ namespace MouseWakeSuppressor
             {
                 if (Cancelled(expected)) { failed++; continue; }
                 if (hardware.Query(id) != DeviceState.Enabled) { failed++; continue; }
+                uncertain = true;
                 Execution run = hardware.Run(id, false, settings.Timeout, () => Cancelled(expected));
                 DeviceState state = hardware.Query(id);
+                uncertain = state == DeviceState.Unknown;
                 SetObserved(id, state, run.Detail);
                 if (state == DeviceState.Disabled && run.Good) success++; else failed++;
                 if (!run.Good || state != DeviceState.Disabled) Warn("無効化未完了: " + id + " " + run.Detail);
@@ -290,9 +292,17 @@ namespace MouseWakeSuppressor
             return Outcome(success, failed);
         }
         private bool Cancelled(long expected) { lock (gate) return stopping || expected != generation; }
+        private void Migrate(Settings source)
+        {
+            var ids = new HashSet<string>(source.Ids, StringComparer.OrdinalIgnoreCase);
+            journal.Save(ids);
+            lock (gate) recovery = ids;
+            migrationPending = false;
+        }
         private string Restore()
         {
             if (corrupt) return "Failed";
+            if (migrationPending) Migrate(config.Load());
             var pending = CopyRecovery();
             int success = 0, failed = 0;
             foreach (string id in CopyRecovery())

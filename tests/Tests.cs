@@ -24,6 +24,8 @@ namespace MouseWakeSuppressor
             if (args.Length != 1 || args[0] != "--test") { Console.WriteLine("実デバイスを変更しないテストです。使い方: __tests.exe --test | --mock <pipe名>"); return 64; }
             try
             {
+                Run("設定修正と復旧中の再予約", RetryAndSchedule);
+                Run("移行失敗後の再起動", RetryMigration);
                 Run("正常往復と状態照会の書き込み回数", RoundTrip);
                 Run("部分失敗と部分状態の toggle", Partial);
                 Run("保存失敗では無効化しない", SaveFailure);
@@ -209,7 +211,7 @@ namespace MouseWakeSuppressor
             internal Settings Value = new Settings { Ids = new List<string> { "HID\\A", "HID\\B" } };
             internal int Resets;
             /// <summary>設定の差し替えを模擬します。</summary>
-            public Settings Load() { return Value; }
+            public Settings Load() { if (Value == null) throw new InvalidDataException(); return Value; }
             /// <summary>reset 実行の有無を記録します。</summary>
             public void Reset() { Resets++; Value = new Settings(); }
         }
@@ -264,6 +266,41 @@ namespace MouseWakeSuppressor
             }
             /// <summary>偽デバイスだけを復旧して worker を回収します。</summary>
             public void Dispose() { if (Engine != null) Engine.Dispose(); }
+        }
+        private static void RetryMigration()
+        {
+            using (var f = new Fixture())
+            {
+                var saved = f.Config.Value;
+                f.Journal.Present = false; f.Config.Value = null;
+                f.Hardware.Set(@"HID\A", DeviceState.Disabled);
+                f.Start(); f.Engine.Dispose();
+                Check(!f.Journal.Exists, "移行失敗を確定");
+                f.Config.Value = saved; f.Start();
+                Check(f.Hardware.Query(@"HID\A") == DeviceState.Enabled, "移行再試行失敗");
+            }
+        }
+        private static void RetryAndSchedule()
+        {
+            using (var f = new Fixture())
+            using (var entered = new ManualResetEvent(false))
+            using (var resume = new ManualResetEvent(false))
+            {
+                f.Config.Value.Ids.Clear(); f.Start();
+                Check(f.Do("disable").Result == "Failed", "未設定");
+                f.Config.Value.Ids.Add(@"HID\A"); f.Do("reload");
+                Check(f.Do("disable").Result == "Success", "設定修正後の無効化");
+                f.Hardware.Hook = (id, enable, cancel) => {
+                    entered.Set(); resume.WaitOne(3000); f.Hardware.Set(id, DeviceState.Enabled);
+                    return new Execution { ExitCode = 0 };
+                };
+                f.Engine.Submit("enable", "on"); Check(entered.WaitOne(3000), "復旧開始");
+                f.Engine.Schedule(); resume.Set();
+                Until(() => f.Engine.Read("on").Operation.Result == "Success");
+                Check(f.Engine.Read("").Scheduled, "復旧中の消灯予約が消失");
+                f.Hardware.Hook = null; f.Timer.Callbacks[0]();
+                Until(() => f.Engine.Read("").State == "Disabled");
+            }
         }
         private static void RoundTrip()
         {

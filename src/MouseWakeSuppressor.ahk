@@ -21,6 +21,7 @@ global g_console := GuidBuffer("{6FE69556-704A-47A0-8F24-C28D936FDA47}")
 global g_session := GuidBuffer("{2B84C20E-AD23-4DDF-93DB-05FFBD7EFCA5}")
 global g_powerSource := GuidBuffer("{5D3E9A59-E9D5-4B00-A6BD-FF34FF516548}")
 global g_onBattery := OnBatteryPower()
+global g_displayRevision := 0
 global g_selection := 0
 global g_lockStatus := "接続待ち"
 global g_initialSelection := IniRead(g_config, "Devices", "InstanceIds", "") = ""
@@ -72,11 +73,13 @@ ServiceState() {
 
 ; 要求を重複させず、復旧要求は未送信の自動無効化より先に送る。
 Request(command, manual := false, *) {
-    global g_pending, g_commands, g_next
+    global g_pending, g_commands, g_next, g_displayRevision
     if manual && (g_pending || g_commands.Length) {
         TrayTip("先の要求の結果を確認中です。", "マウス再点灯防止")
         return
     }
+    if command = "enable" || command = "schedule"
+        g_displayRevision++
     if command = "enable" {
         retained := []
         for item in g_commands
@@ -141,14 +144,17 @@ Pump() {
     }
     watch := g_pending ? g_pending.id : ""
     g_next := now + MwsPollInterval(g_onBattery, g_pending, g_interval, g_batteryInterval, g_fast)
-    g_client.Send("2`t" id "`t" g_boot "`t" command "`t" watch "`n", Receive.Bind(id, command, manual))
+    g_client.Send("2`t" id "`t" g_boot "`t" command "`t" watch "`n", Receive.Bind(id, command, manual, g_displayRevision))
 }
 
 ; 完了通知は送信した request と同じ boot に限定する。
-Receive(id, command, manual, text, error) {
+Receive(id, command, manual, revision, text, error) {
     global g_boot, g_pending, g_next, g_fast, g_initialSelection, g_commands
     global g_lockStatus
+    retryDisplay := !manual && revision = g_displayRevision && (command = "enable" || command = "schedule")
     if error != "" {
+        if retryDisplay
+            g_commands.Push({command: command, manual: false})
         g_lockStatus := "通信不能: " error
         service := ServiceState()
         label := service = 0 ? "サービス未インストール" : service = 1 ? "サービス停止" : service = 2 || service = 3 ? "サービス移行中" : "通信不能"
@@ -160,6 +166,11 @@ Receive(id, command, manual, text, error) {
         state := MwsParse(text, id)
         g_lockStatus := state.lockDisplay
         g_boot := state.boot
+        if retryDisplay && state.accepted != "Accepted" {
+            g_commands.Push({command: command, manual: false})
+            ScheduleNextPump()
+            return
+        }
         completion := MwsCompletion(state, g_pending, command)
         if completion.clear {
             if completion.success && g_pending.command = "reset"
@@ -206,7 +217,7 @@ ShowTray(state, detail, devices := []) {
     g_lastTray := key
     TraySetIcon("shell32.dll", view.icon)
     A_IconTip := view.tip
-    MwsBuildTray(A_TrayMenu, label, detail, devices, TrayRequest, ShowDevice, ShowLockStatus, (*) => ExitApp())
+    MwsBuildTray(A_TrayMenu, label, detail, devices, TrayRequest, ShowDevice, ShowLockStatus)
 }
 
 ; 診断の目的と判定方法を示してから、利用者の操作で開始する。
@@ -311,7 +322,6 @@ SaveKeyboards(window, list, devices, enabled, idle, retry, *) {
         section := "Enabled=" enabled.Value "`nIdleTimeoutSeconds=" idle.Value "`nRetryIntervalMs=" retry.Value "`nKeyboardInstanceIds=" ids
         IniWrite(section, g_config, "LockDisplay")
         CloseSelection(window)
-        Request("reload", true)
     } catch as err {
         MsgBox("設定保存に失敗しました: " err.Message, "ロック中の強制消灯", "Iconx")
     }

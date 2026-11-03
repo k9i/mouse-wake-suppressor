@@ -18,7 +18,7 @@ MwsPresentation(state, detail) {
 }
 
 ; 状態表示と操作を分離し、ダブルクリックによる意図しない無効化を防ぐ。
-MwsBuildTray(rootMenu, label, detail, devices, request, showDevice, showLock, quit) {
+MwsBuildTray(rootMenu, label, detail, devices, request, showDevice, showLock) {
     rootMenu.Delete()
     for text in ["マウス: " label, "Win+Shift+M: マウス無効化 / 復旧"] {
         rootMenu.Add(text, (*) => 0)
@@ -46,7 +46,7 @@ MwsBuildTray(rootMenu, label, detail, devices, request, showDevice, showLock, qu
     rootMenu.Add("マウス再点灯防止", mouse)
     rootMenu.Add("ロック中の強制消灯", lock)
     rootMenu.Add()
-    rootMenu.Add("終了", quit)
+    rootMenu.AddStandard()
     rootMenu.Default := ""
     return {mouse: mouseActions, lock: lockActions}
 }

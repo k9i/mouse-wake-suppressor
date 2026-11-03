@@ -31,7 +31,7 @@ try {
     ; 実サービスへ送信せず、menu に割り当てた callback の操作先を確認する。
     calls := []
     rootMenu := A_TrayMenu
-    actions := MwsBuildTray(rootMenu, "有効", "", [], (command, manual := false, *) => calls.Push(command ":" manual), (*) => 0, (*) => calls.Push("monitor"), (*) => 0)
+    actions := MwsBuildTray(rootMenu, "有効", "", [], (command, manual := false, *) => calls.Push(command ":" manual), (*) => 0, (*) => calls.Push("monitor"))
     Check(rootMenu.Default = "" && DllCall("GetMenuDefaultItem", "Ptr", rootMenu.Handle, "UInt", 0, "UInt", 0, "UInt") = 0xFFFFFFFF, "ダブルクリックの default 操作を解除")
     loop 2
         Check(DllCall("GetMenuState", "Ptr", rootMenu.Handle, "UInt", A_Index - 1, "UInt", 0x400, "UInt") & 3, "状態とショートカット説明は選択不可")
